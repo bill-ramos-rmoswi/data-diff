@@ -22,8 +22,10 @@ from data_diff.query_utils import drop_table
 tracking.disable_tracking()
 
 # We write 'or None' because Github sometimes creates empty env vars for secrets
-TEST_MYSQL_CONN_STRING: str = "mysql://mysql:Password1@localhost/mysql"
-TEST_POSTGRESQL_CONN_STRING: str = "postgresql://postgres:Password1@localhost/postgres"
+TEST_MYSQL_CONN_STRING: str = os.environ.get("DATADIFF_MYSQL_URI") or "mysql://mysql:Password1@localhost/mysql"
+TEST_POSTGRESQL_CONN_STRING: str = (
+    os.environ.get("DATADIFF_POSTGRESQL_URI") or "postgresql://postgres:Password1@localhost/postgres"
+)
 TEST_SNOWFLAKE_CONN_STRING: str = os.environ.get("DATADIFF_SNOWFLAKE_URI") or None
 TEST_PRESTO_CONN_STRING: str = os.environ.get("DATADIFF_PRESTO_URI") or None
 TEST_BIGQUERY_CONN_STRING: str = os.environ.get("DATADIFF_BIGQUERY_URI") or None
