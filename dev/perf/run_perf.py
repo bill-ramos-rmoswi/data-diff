@@ -42,7 +42,10 @@ def changed_rows(conn, table_sql: str) -> str:
 
 def changed_keys(conn, table_sql: str) -> set:
     columns = ", ".join(conn.dialect.quote(column) for column in KEY_COLUMNS)
-    return {tuple(str(value) for value in row) for row in conn.query(f"SELECT {columns} FROM {changed_rows(conn, table_sql)}", list)}
+    return {
+        tuple(str(value) for value in row)
+        for row in conn.query(f"SELECT {columns} FROM {changed_rows(conn, table_sql)}", list)
+    }
 
 
 def save_rows(conn, table_sql: str):
@@ -118,7 +121,9 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
     record("identical", duration, len(diff))
 
     cost = quote("UnitCost")
-    conn.query(f"UPDATE {table_sql} SET {cost} = {cost} + 1 WHERE {changed_rows(conn, table_sql).split(' WHERE ')[1]}", None)
+    conn.query(
+        f"UPDATE {table_sql} SET {cost} = {cost} + 1 WHERE {changed_rows(conn, table_sql).split(' WHERE ')[1]}", None
+    )
     conn.query(commit)
     try:
         diff, duration = run_diff(source, target, table)
