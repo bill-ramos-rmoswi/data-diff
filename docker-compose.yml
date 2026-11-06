@@ -119,7 +119,8 @@ services:
       env_file:
         - dev/dev.env
       healthcheck:
-        test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to testdb' > /dev/null"]
+        # The log setting proves dev/db2/init.sh ran, which restarts the database.
+        test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to testdb && db2 get db cfg for testdb' | grep -q 'LOGFILSIZ) = 16384'"]
         interval: 15s
         timeout: 30s
         retries: 40

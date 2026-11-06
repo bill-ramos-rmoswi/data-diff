@@ -72,7 +72,8 @@ V = TypeVar("V")
 
 class CaseAwareMapping(MutableMapping[str, V]):
     @abstractmethod
-    def get_key(self, key: str) -> str: ...
+    def get_key(self, key: str) -> str:
+        ...
 
     def new(self, initial=()) -> Self:
         return type(self)(initial)

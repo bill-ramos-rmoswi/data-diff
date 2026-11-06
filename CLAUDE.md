@@ -4,23 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status and current goal
 
-Upstream Datafold stopped developing open source data-diff in May 2024, so upstream won't review or merge changes here.
+Upstream Datafold stopped developing open source data-diff in May 2024, so this fork (`bill-ramos-rmoswi/data-diff`) owns its CI and releases. Don't open PRs against `datafold/data-diff`; pass `--repo bill-ramos-rmoswi/data-diff` to `gh`.
 
-Current goal: add IBM Db2 12.x support and test it against SQL Server 2025 (latest CU) and PostgreSQL 18.6 (community release).
+Goal: use the Python API to validate data between IBM Db2 12.1, SQL Server 2025 (latest CU) and PostgreSQL 18.6, deployed as a wheel attached to a GitHub Release.
 
-Where the repo stands against that goal:
+Pinned targets are in `docker-compose.yml`: `db2:12.1.5.0`, `mssql/server:2025-CU9-GDR1-ubuntu-24.04` and `postgres:18.6`. MySQL stays in the stack because `test_api.py`, `test_sql.py` and `test_main.py` hardcode it.
 
-- There is no Db2 code yet: no driver, extra, compose service or test wiring.
-- `docker-compose.yml` has no SQL Server service, and its Postgres is pinned to `postgres:14.1-alpine`. The `postgresql-data` volume holds Postgres 14 data, which Postgres 18 can't open, so recreate the volume after bumping the image.
-- `TEST_MSSQL_CONN_STRING` comes from `DATADIFF_MSSQL_URI`, and neither CI workflow sets it, so CI doesn't run the MsSQL driver.
-- `pyodbc` is an optional extra (`mssql`) but not a dev dependency. `MsSQL` hardcodes `ODBC Driver 18 for SQL Server`, which must be installed on the host running the tests.
+## Environment
+
+Work inside the devcontainer, opened from the WSL clone at `~/repos/data-diff`: Python 3.11, Poetry 1.8.5, ODBC Driver 18, `sqlcmd`/`bcp` and `psql` are preinstalled, and `DATADIFF_*_URI` is set to compose service names.
+
+The container has no Docker socket. Start, stop and reset databases from a WSL terminal:
+
+```shell
+docker compose up -d --wait postgres mysql mssql db2     # Db2 takes a minute or more when its volume is new
+docker compose --profile legacy up -d                    # stale databases: presto, trino, clickhouse, vertica
+docker compose down -v                                   # delete all database volumes
+```
+
+From outside the compose network, SQL Server is on host port **14330**, because a local instance may hold 1433. `Db2` needs `dev/db2/init.sh`, which raises the transaction log limits; its healthcheck waits for that.
 
 ## Commands
 
 ```shell
 poetry install                                   # install with dev dependencies
-docker compose up -d mysql postgres              # databases for tests; MySQL is the minimum (see below)
-poetry run unittest-parallel -j 16               # all tests
+poetry run unittest-parallel -j 8                # all tests
 poetry run python -m unittest -k <test>          # tests matching a name
 poetry run python -m unittest -f -k <test>       # same, stop at the first failure
 poetry run python -m unittest tests.test_query   # one module
@@ -29,15 +37,15 @@ poetry run python3 -m data_diff <db1_uri> <table1> <db2_uri> <table2> --verbose
 ```
 
 - Tests use `unittest`, not pytest.
-- CI runs `TEST_ACROSS_ALL_DBS=0 poetry run unittest-parallel -j 16` on Python 3.8-3.11, and the full cross-database suite on 3.11.
-- CI's formatter check is `ruff format`. `CONTRIBUTING.md` still says `black -l 120`; line length is 120 either way.
+- `.github/workflows/pr-validate.yml` runs formatting, unit tests on Python 3.9-3.11, and every database pair on 3.11. Pushing a `v*` tag matching the package version runs `release.yml`, which publishes the wheel.
+- `CONTRIBUTING.md` still says `black -l 120`. CI uses `ruff format`.
 - `LOG_LEVEL=DEBUG` prints every query and the type detected for each column.
 
 ## Test configuration
 
 `tests/common.py` holds a `TEST_<DB>_CONN_STRING` for each database. Those with a `None` value are skipped silently, so a database that isn't configured looks like a passing run. Check the `Testing databases:` line printed at import.
 
-Override connection strings in `tests/local_settings.py` (git-ignored), or use the `DATADIFF_*_URI` environment variables. MySQL, PostgreSQL and DuckDB have non-`None` defaults, so MySQL and PostgreSQL must be running, or be set to `None` in `local_settings.py`.
+Override connection strings in `tests/local_settings.py` (git-ignored), or use the `DATADIFF_*_URI` environment variables. MySQL, PostgreSQL and DuckDB have non-`None` defaults, so MySQL and PostgreSQL must be running.
 
 `TEST_ACROSS_ALL_DBS` controls which pairs `tests/test_database_types.py` runs:
 
@@ -47,9 +55,18 @@ Override connection strings in `tests/local_settings.py` (git-ignored), or use t
 | `0` | PostgreSQL against itself |
 | `full` | every configured database against every other |
 
-Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full`. To test just Db2, SQL Server and PostgreSQL, set the other connection strings to `None`.
+Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/test_cross_db_fact.py`.
 
 `N_SAMPLES` sets the row count per type test (default 50), and `N_THREADS` sets the thread count (default 1).
+
+## Database behavior that's easy to get wrong
+
+- **Db2 truncates; PostgreSQL and SQL Server round.** This applies to `CAST`, `DECIMAL` inserts and `TIMESTAMP(n)`, so rounding must be explicit.
+- **Db2 `ibm_db_dbi` turns autocommit off.** The driver turns it on. Without that, a `CREATE TABLE` holds catalog locks forever, which only shows up as a hang in parallel runs.
+- **SQL Server `uniqueidentifier` doesn't sort like a string**, and renders in uppercase. Key ranges compare it through `key_range_expr`, which can't use an index, so these keys are slower.
+- **Locale collations hide casing bugs.** PostgreSQL's default sort ignores case, so test string keys on a binary collation too. Db2 and DuckDB use one.
+- **Close API connections.** PostgreSQL connections from `connect_to_table` stay in a transaction, which blocks `DROP TABLE`. Call `segment.database.close()` when done.
+- **Db2 table and column names are case-sensitive here.** data-diff quotes them, and Db2 stores unquoted names in uppercase, so pass `FACT`, not `fact`, for a table created without quotes.
 
 ## Architecture
 
@@ -89,5 +106,5 @@ A new database touches all of these:
 - `pyproject.toml`: the optional dependency, `[tool.poetry.extras]`, `all-dbs` and the dev dependencies
 - `tests/common.py`: `TEST_<DB>_CONN_STRING` and the `CONN_STRINGS` entry
 - `tests/test_database_types.py`: the `DATABASE_TYPES` entry
-- `tests/test_database.py`: `TEST_DATABASES`
-- `docker-compose.yml`, `dev/dev.env`, and `.github/workflows/ci.yml` and `ci_full.yml`
+- `tests/test_database.py`, `tests/test_diff_tables.py` and `tests/test_joindiff.py`: `TEST_DATABASES`
+- `docker-compose.yml`, `dev/dev.env`, and `.github/workflows/pr-validate.yml`

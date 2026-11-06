@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/pr-validate.yml
+
+  release:
+    name: Publish wheel to a GitHub Release
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Poetry
+        run: pipx install "poetry==1.8.5"
+      - name: Check that the tag matches the package version
+        run: |
+          package_version="$(poetry version --short)"
+          if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match package version $package_version"
+            exit 1
+          fi
+      - name: Build
+        run: poetry build
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes

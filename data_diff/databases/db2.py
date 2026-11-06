@@ -247,6 +247,9 @@ class Db2(ThreadedDatabase):
         )
 
     def _query_cursor(self, c, sql_code: str):
+        # ibm_db cuts one character off the end of a statement for each character outside the
+        # Basic Multilingual Plane, such as an emoji in a key bound. Trailing spaces absorb that.
+        sql_code += " " * sum(ord(char) > 0xFFFF for char in sql_code)
         try:
             return super()._query_cursor(c, sql_code)
         except self._db2.Error as e:
