@@ -32,8 +32,9 @@ from data_diff.abcs.database_types import (
     Date,
     Time,
 )
-from data_diff.queries.ast_classes import CreateTable, Expr
+from data_diff.queries.ast_classes import Code, Concat, CreateTable, Expr
 from data_diff.queries.extras import NormalizeAsString
+from data_diff.utils import join_iter
 
 
 @import_helper("mssql")
@@ -199,8 +200,31 @@ class Dialect(BaseDialect):
     def normalize_uuid(self, value: str, coltype: ColType_UUID) -> str:
         if isinstance(coltype, Native_UUID):
             # SQL Server renders UNIQUEIDENTIFIER in uppercase, and other databases use lowercase.
-            return f"LOWER({self.to_string(value)})"
+            return f"LOWER(CONVERT(CHAR(36), {value}))"
         return super().normalize_uuid(value, coltype)
+
+    def normalize_value_by_type(self, value: str, coltype: ColType) -> str:
+        # NVARCHAR(MAX) makes checksums about 3 times slower, so only text pays for it
+        if isinstance(coltype, Integer):
+            return f"CONVERT(VARCHAR(50), {value})"
+        return super().normalize_value_by_type(value, coltype)
+
+    def render_concat(self, c: Compiler, elem: Concat) -> str:
+        if self._prevent_overflow_when_concat:
+            return super().render_concat(c, elem)
+
+        def as_string(expr) -> str:
+            # Checksums pass normalized strings, which to_string() would only slow down. Other
+            # callers pass raw columns, and coalesce() can't mix an INT with '<null>'.
+            compiled = self.compile(c, expr)
+            return compiled if isinstance(expr, (Code, NormalizeAsString)) else self.to_string(compiled)
+
+        items = [f"coalesce({as_string(expr)}, '<null>')" for expr in elem.exprs]
+        if len(items) == 1:
+            return items[0]
+        if elem.sep:
+            items = list(join_iter(f"'{elem.sep}'", items))
+        return self.concat(items)
 
     def _hash_md5(self, s: str) -> str:
         # Other databases hash UTF-8 bytes. HASHBYTES hashes the bytes of the value it receives,

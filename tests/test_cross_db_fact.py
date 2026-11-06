@@ -62,7 +62,6 @@ DIRECTIONS = [
 ]
 
 
-@unittest.skipUnless(DIRECTIONS, "Requires at least two of PostgreSQL, SQL Server and Db2")
 class TestCrossDatabaseFactTable(unittest.TestCase):
     def setUp(self):
         self.table_name = f"fact{random_table_suffix()}"
@@ -111,13 +110,13 @@ class TestCrossDatabaseFactTable(unittest.TestCase):
             segment.database.close()
         return diff
 
-    @parameterized.expand(DIRECTIONS)
+    @parameterized.expand(DIRECTIONS, skip_on_empty=True)
     def test_identical_tables(self, _, source, target):
         self._create_table(source, ROWS)
         self._create_table(target, ROWS)
         self.assertEqual([], self._diff(source, target))
 
-    @parameterized.expand(DIRECTIONS)
+    @parameterized.expand(DIRECTIONS, skip_on_empty=True)
     def test_reports_exact_differences(self, _, source, target):
         self._create_table(source, ROWS)
 
