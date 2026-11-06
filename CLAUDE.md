@@ -22,7 +22,7 @@ docker compose --profile legacy up -d                    # stale databases: pres
 docker compose down -v                                   # delete all database volumes
 ```
 
-From outside the compose network, SQL Server is on host port **14330**, because a local instance may hold 1433. `Db2` needs `dev/db2/init.sh`, which raises the transaction log limits; its healthcheck waits for that.
+From outside the compose network, SQL Server is on host port **14330**, because a local instance may hold 1433. Db2 needs `dev/db2/init.sh`, which raises the transaction log limits, and its healthcheck waits for that.
 
 ## Commands
 
@@ -59,6 +59,17 @@ Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/
 
 `N_SAMPLES` sets the row count per type test (default 50), and `N_THREADS` sets the thread count (default 1).
 
+## Performance tests
+
+`dev/perf/seed.py` grows `fact_base.csv` (an export of `AdventureWorksDW2022.dbo.FactProductInventory`, git-ignored in `dev/perf/data/`) with a cross join in SQL Server, then bulk-loads identical rows into PostgreSQL and Db2. `fact_2x` has 1.55M rows and `fact_13x` has 10.09M.
+
+```shell
+poetry run python dev/perf/seed.py                       # about 1 minute
+poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, writes benchmark_<revision>.jsonl
+```
+
+`run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB.
+
 ## Database behavior that's easy to get wrong
 
 - **Db2 truncates; PostgreSQL and SQL Server round.** This applies to `CAST`, `DECIMAL` inserts and `TIMESTAMP(n)`, so rounding must be explicit.
@@ -66,6 +77,7 @@ Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/
 - **SQL Server `uniqueidentifier` doesn't sort like a string**, and renders in uppercase. Key ranges compare it through `key_range_expr`, which can't use an index, so these keys are slower.
 - **Locale collations hide casing bugs.** PostgreSQL's default sort ignores case, so test string keys on a binary collation too. Db2 and DuckDB use one.
 - **Close API connections.** PostgreSQL connections from `connect_to_table` stay in a transaction, which blocks `DROP TABLE`. Call `segment.database.close()` when done.
+- **`NVARCHAR(MAX)` is expensive on SQL Server.** It made checksums about 3 times slower, so only text columns use it. `FORMAT()` is slower still, and adds thousands separators.
 - **Db2 table and column names are case-sensitive here.** data-diff quotes them, and Db2 stores unquoted names in uppercase, so pass `FACT`, not `fact`, for a table created without quotes.
 
 ## Architecture
