@@ -1,19 +1,18 @@
 """Grows FactProductInventory with a cross join, and loads the result into all three databases.
 
-Run this in the devcontainer, after exporting the base table to dev/perf/data/fact_base.csv:
-
-    bcp "SELECT ProductKey, DateKey, CONVERT(char(10), MovementDate, 23), UnitCost, UnitsIn, UnitsOut,
-         UnitsBalance FROM AdventureWorksDW2022.dbo.FactProductInventory ORDER BY ProductKey, DateKey"
-        queryout fact_base.csv -S localhost -T -u -c -t "," -r "\\n"
+Run this in the devcontainer:
 
     poetry run python dev/perf/seed.py
 
-SQL Server builds the larger tables. Each one is exported once and bulk-loaded into the other
-databases, so every database holds identical rows.
+The base table comes from Microsoft's AdventureWorksDW2022 sample backup, which is downloaded to
+dev/perf/data/ and restored in the SQL Server container. SQL Server builds the larger tables. Each
+one is exported once and bulk-loaded into the other databases, so every database holds identical rows.
 """
+import hashlib
 import os
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
@@ -21,9 +20,14 @@ from data_diff import connect
 from data_diff.queries.api import commit
 
 DATA_DIR = Path(__file__).parent / "data"
-# Where the Db2 container sees DATA_DIR, because LOAD reads files on the server
-DB2_DATA_DIR = "/perf-data"
+# Where the SQL Server and Db2 containers see DATA_DIR, because RESTORE and LOAD read files on the server
+SERVER_DATA_DIR = "/perf-data"
 TABLES = {"fact_2x": 2, "fact_13x": 13}
+
+SAMPLE_DATABASE = "AdventureWorksDW2022"
+BACKUP_FILE = f"{SAMPLE_DATABASE}.bak"
+BACKUP_URL = f"https://github.com/microsoft/sql-server-samples/releases/download/adventureworks/{BACKUP_FILE}"
+BACKUP_SHA256 = "ac4a39502645c31f114331be28ce671ac5f70b0645f2aa59d8dccfbaae081c05"
 
 MSSQL_URI = os.environ["DATADIFF_MSSQL_URI"]
 POSTGRESQL_URI = os.environ["DATADIFF_POSTGRESQL_URI"]
@@ -42,26 +46,53 @@ def timed(label: str):
     return decorator
 
 
-def bcp(*args):
+def mssql_login() -> list:
     uri = urlsplit(MSSQL_URI)
     database = uri.path.split("/")[1]
-    login = ["-S", f"{uri.hostname},{uri.port or 1433}", "-U", uri.username, "-P", uri.password, "-u", "-d", database]
-    subprocess.run(["bcp", *args, *login, "-c", "-t", ","], check=True, stdout=subprocess.DEVNULL)
+    return ["-S", f"{uri.hostname},{uri.port or 1433}", "-U", uri.username, "-P", uri.password, "-d", database]
 
 
-@timed("Loaded base table into SQL Server")
+def bcp(*args):
+    subprocess.run(["bcp", *args, *mssql_login(), "-u", "-c", "-t", ","], check=True, stdout=subprocess.DEVNULL)
+
+
+def sqlcmd(query: str):
+    # RESTORE can't run in a transaction, so this doesn't go through the driver
+    subprocess.run(["sqlcmd", *mssql_login(), "-C", "-b", "-Q", query], check=True, stdout=subprocess.DEVNULL)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@timed("Downloaded the sample backup")
+def download_backup():
+    path = DATA_DIR / BACKUP_FILE
+    if not path.exists():
+        partial = path.with_suffix(".part")
+        urllib.request.urlretrieve(BACKUP_URL, partial)
+        partial.rename(path)
+    assert sha256(path) == BACKUP_SHA256, f"Unexpected checksum for {path}. Delete it to download it again."
+
+
+@timed("Restored the base table in SQL Server")
 def load_base_table():
-    conn = connect(MSSQL_URI, shared=False)
-    conn.query("DROP TABLE IF EXISTS fact_base", None)
-    conn.query(
-        "CREATE TABLE fact_base (ProductKey INT NOT NULL, DateKey INT NOT NULL, MovementDate DATE NOT NULL, "
-        "UnitCost MONEY NOT NULL, UnitsIn INT NOT NULL, UnitsOut INT NOT NULL, UnitsBalance INT NOT NULL)",
-        None,
+    data_files = "/var/opt/mssql/data"
+    sqlcmd(
+        f"RESTORE DATABASE {SAMPLE_DATABASE} FROM DISK = '{SERVER_DATA_DIR}/{BACKUP_FILE}' WITH REPLACE, "
+        f"MOVE '{SAMPLE_DATABASE}' TO '{data_files}/{SAMPLE_DATABASE}.mdf', "
+        f"MOVE '{SAMPLE_DATABASE}_log' TO '{data_files}/{SAMPLE_DATABASE}_log.ldf'"
     )
-    conn.query(commit)
-    conn.close()
-    # bcp on Windows ends lines with CRLF
-    bcp("fact_base", "in", str(DATA_DIR / "fact_base.csv"), "-r", "\\r\\n")
+    sqlcmd(
+        "DROP TABLE IF EXISTS fact_base; "
+        "SELECT ProductKey, DateKey, MovementDate, UnitCost, UnitsIn, UnitsOut, UnitsBalance INTO fact_base "
+        f"FROM {SAMPLE_DATABASE}.dbo.FactProductInventory; "
+        f"DROP DATABASE {SAMPLE_DATABASE}"
+    )
 
 
 @timed("Built in SQL Server")
@@ -128,7 +159,7 @@ def load_into_db2(name: str):
         'PRIMARY KEY ("ScaleKey", "ProductKey", "DateKey"))',
         None,
     )
-    load = f"LOAD FROM {DB2_DATA_DIR}/{name}.csv OF DEL REPLACE INTO {table} NONRECOVERABLE"
+    load = f"LOAD FROM {SERVER_DATA_DIR}/{name}.csv OF DEL REPLACE INTO {table} NONRECOVERABLE"
     conn.query(f"CALL SYSPROC.ADMIN_CMD('{load}')", None)
     runstats = f"RUNSTATS ON TABLE {table} WITH DISTRIBUTION AND INDEXES ALL"
     conn.query(f"CALL SYSPROC.ADMIN_CMD('{runstats}')", None)
@@ -137,6 +168,7 @@ def load_into_db2(name: str):
 
 def main():
     assert not dict(parse_qsl(urlsplit(MSSQL_URI).query)).get("database"), "Unexpected database in the URI query"
+    download_backup()
     load_base_table()
     for name, scale in TABLES.items():
         build_in_mssql(name, scale)

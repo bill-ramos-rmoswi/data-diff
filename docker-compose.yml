@@ -69,6 +69,8 @@ services:
         MSSQL_PID: Developer
       volumes:
         - mssql-data:/var/opt/mssql
+        # RESTORE reads files on the server. See dev/perf/seed.py
+        - ./dev/perf/data:/perf-data:ro
       ports:
         # 14330 on the host, so this doesn't collide with a local SQL Server on 1433
         - '14330:1433'

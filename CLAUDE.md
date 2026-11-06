@@ -61,7 +61,7 @@ Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/
 
 ## Performance tests
 
-`dev/perf/seed.py` grows `fact_base.csv` (an export of `AdventureWorksDW2022.dbo.FactProductInventory`, git-ignored in `dev/perf/data/`) with a cross join in SQL Server, then bulk-loads identical rows into PostgreSQL and Db2. `fact_2x` has 1.55M rows and `fact_13x` has 10.09M.
+`dev/perf/seed.py` downloads Microsoft's `AdventureWorksDW2022.bak` (101 MB, checksum-pinned, git-ignored in `dev/perf/data/`), restores it in the SQL Server container, grows `FactProductInventory` with a cross join, then bulk-loads identical rows into PostgreSQL and Db2. `fact_2x` has 1.55M rows and `fact_13x` has 10.09M.
 
 ```shell
 poetry run python dev/perf/seed.py                       # about 1 minute
