@@ -113,6 +113,7 @@ services:
         HADR_ENABLED: "false"
       volumes:
         - db2-data:/database
+        - ./dev/db2/init.sh:/var/custom/init.sh:ro
       ports:
         - '50000:50000'
       env_file:

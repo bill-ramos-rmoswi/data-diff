@@ -10,7 +10,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -22,7 +21,7 @@ classifiers = [
 packages = [{ include = "data_diff" }]
 [tool.poetry.dependencies]
 pydantic = ">=1.10.12"
-python = ">=3.8.0,<4.0"
+python = ">=3.9,<4.0"
 dsnparse = "<0.2.0"
 click = ">=8.1"
 rich = "*"
@@ -43,6 +42,7 @@ vertica-python = {version="*", optional=true}
 urllib3 = "<2"
 oracledb = {version = "*", optional=true}
 pyodbc = {version=">=4.0.39", optional=true}
+ibm-db = {version=">=3.2.6", optional=true}
 typing-extensions = ">=4.0.1"
 attrs = ">=23.1.0"
 mashumaro = {version = ">=2.9,<3.11.0", extras = ["msgpack"]}
@@ -59,6 +59,8 @@ trino = ">=0.314.0"
 presto-python-client = ">=0.8.3"
 clickhouse-driver = "*"
 vertica-python = "*"
+pyodbc = ">=4.0.39"
+ibm-db = ">=3.2.6"
 duckdb = ">=0.9.0"
 dbt-core = ">=1.0.0"
 ruff = ">=0.1.4"
@@ -75,6 +77,7 @@ snowflake = ["snowflake-connector-python", "cryptography"]
 presto = ["presto-python-client"]
 oracle = ["oracledb"]
 mssql = ["pyodbc"]
+db2 = ["ibm-db"]
 # databricks = ["databricks-sql-connector"]
 trino = ["trino"]
 clickhouse = ["clickhouse-driver"]
@@ -82,7 +85,7 @@ vertica = ["vertica-python"]
 duckdb = ["duckdb"]
 all-dbs = [
     "preql", "mysql-connector-python", "psycopg2", "snowflake-connector-python", "cryptography", "presto-python-client",
-    "oracledb", "pyodbc", "trino", "clickhouse-driver", "vertica-python", "duckdb"
+    "oracledb", "pyodbc", "ibm-db", "trino", "clickhouse-driver", "vertica-python", "duckdb"
 ]
 
 [tool.poetry.group.dev.dependencies]

@@ -848,8 +848,7 @@ class BaseDialect(abc.ABC):
     def normalize_uuid(self, value: str, coltype: ColType_UUID) -> str:
         """Creates an SQL expression, that strips uuids of artifacts like whitespace."""
         if isinstance(coltype, String_UUID):
-            trimmed = f"TRIM({value})"
-            return f"LOWER({trimmed})" if coltype.ignore_case else trimmed
+            return f"TRIM({value})"
         return self.to_string(value)
 
     def normalize_json(self, value: str, _coltype: JSON) -> str:
@@ -885,7 +884,10 @@ class BaseDialect(abc.ABC):
         elif isinstance(coltype, FractionalType):
             return self.normalize_number(value, coltype)
         elif isinstance(coltype, ColType_UUID):
-            return self.normalize_uuid(value, coltype)
+            normalized = self.normalize_uuid(value, coltype)
+            if isinstance(coltype, String_UUID) and coltype.ignore_case:
+                return f"LOWER({normalized})"
+            return normalized
         elif isinstance(coltype, Boolean):
             return self.normalize_boolean(value, coltype)
         elif isinstance(coltype, JSON):
@@ -1179,7 +1181,8 @@ class Database(abc.ABC):
         assert isinstance(sql_code, str), sql_code
         try:
             c.execute(sql_code)
-            if sql_code.lower().startswith(("select", "explain", "show")):
+            # SQL Server's SELECT ... INTO starts with SELECT, but returns no result set
+            if sql_code.lower().startswith(("select", "explain", "show")) and c.description is not None:
                 columns = [col[0] for col in c.description]
 
                 fetched = c.fetchall()

@@ -204,7 +204,13 @@ class TableSegment:
     def segment_by_checkpoints(self, checkpoints: List[List[DbKey]]) -> List["TableSegment"]:
         "Split the current TableSegment to a bunch of smaller ones, separated by the given checkpoints"
 
-        return [self.new_key_bounds(min_key=s, max_key=e) for s, e in create_mesh_from_points(*checkpoints)]
+        # Checkpoints come from one of the two tables, so convert them to this table's key types.
+        # Otherwise the casing of UUIDs leaks across, and selects no rows where string order is binary.
+        key_types = [self._schema[k] for k in self.key_columns] if self._schema else None
+        return [
+            self.new_key_bounds(min_key=s, max_key=e, key_types=key_types)
+            for s, e in create_mesh_from_points(*checkpoints)
+        ]
 
     def new(self, **kwargs) -> Self:
         """Creates a copy of the instance using 'replace()'"""

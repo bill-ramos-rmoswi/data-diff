@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, ClassVar, Dict, Optional, Type
 
 import attrs
@@ -11,6 +12,7 @@ from data_diff.databases.base import (
     import_helper,
     ConnectError,
     BaseDialect,
+    Compiler,
 )
 from data_diff.abcs.database_types import (
     JSON,
@@ -30,7 +32,7 @@ from data_diff.abcs.database_types import (
     Date,
     Time,
 )
-from data_diff.queries.ast_classes import Expr
+from data_diff.queries.ast_classes import CreateTable, Expr
 from data_diff.queries.extras import NormalizeAsString
 
 
@@ -121,7 +123,8 @@ class Dialect(BaseDialect):
 
     def type_repr(self, t) -> str:
         try:
-            return {bool: "bit", str: "text"}[t]
+            # TIMESTAMP means a row version in SQL Server, not a point in time
+            return {bool: "bit", str: "NVARCHAR(4000)", datetime: "DATETIME2(6)", float: "FLOAT"}[t]
         except KeyError:
             return super().type_repr(t)
 
@@ -154,7 +157,20 @@ class Dialect(BaseDialect):
 
     def constant_values(self, rows) -> str:
         values = ", ".join("(%s)" % ", ".join(self._constant_value(v) for v in row) for row in rows)
-        return f"VALUES {values}"
+        # A plain VALUES clause allows at most 1000 rows, and a derived table has no such limit.
+        columns = ", ".join(f"c{i}" for i in range(len(rows[0])))
+        return f"SELECT * FROM (VALUES {values}) AS constant_values({columns})"
+
+    def render_createtable(self, c: Compiler, elem: CreateTable) -> str:
+        path = self.compile(c, elem.path)
+        if elem.source_table:
+            # SQL Server has no CREATE TABLE ... AS SELECT
+            statement = f"SELECT * INTO {path} FROM ({self.compile(c, elem.source_table)}) AS source"
+        else:
+            statement = super().render_createtable(c, attrs.evolve(elem, if_not_exists=False))
+
+        # SQL Server has no CREATE TABLE IF NOT EXISTS
+        return f"IF OBJECT_ID('{path}') IS NULL {statement}" if elem.if_not_exists else statement
 
     def normalize_timestamp(self, value: str, coltype: TemporalType) -> str:
         if isinstance(coltype, Date):

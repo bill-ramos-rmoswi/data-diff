@@ -28,6 +28,8 @@ TEST_DATABASES = {
     db.Presto,
     db.Trino,
     db.Vertica,
+    db.MsSQL,
+    db.Db2,
 }
 
 test_each_database = test_each_database_in_list(TEST_DATABASES)
