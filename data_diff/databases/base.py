@@ -848,7 +848,8 @@ class BaseDialect(abc.ABC):
     def normalize_uuid(self, value: str, coltype: ColType_UUID) -> str:
         """Creates an SQL expression, that strips uuids of artifacts like whitespace."""
         if isinstance(coltype, String_UUID):
-            return f"TRIM({value})"
+            trimmed = f"TRIM({value})"
+            return f"LOWER({trimmed})" if coltype.ignore_case else trimmed
         return self.to_string(value)
 
     def normalize_json(self, value: str, _coltype: JSON) -> str:
@@ -894,6 +895,13 @@ class BaseDialect(abc.ABC):
         elif isinstance(coltype, Struct):
             return self.normalize_struct(value, coltype)
         return self.to_string(value)
+
+    def key_range_expr(self, column: Expr, coltype: Optional[ColType]) -> Expr:
+        """Returns the expression that key range filters should compare, for a key column.
+
+        Override this when a key type doesn't sort the same way as in other databases.
+        """
+        return column
 
     def optimizer_hints(self, hints: str) -> str:
         return f"/*+ {hints} */ "

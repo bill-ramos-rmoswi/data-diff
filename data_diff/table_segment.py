@@ -13,6 +13,7 @@ from data_diff.abcs.database_types import DbPath, DbKey, DbTime, IKey
 from data_diff.schema import RawColumnInfo, Schema, create_schema
 from data_diff.queries.extras import Checksum
 from data_diff.queries.api import Count, SKIP, table, this, Expr, min_, max_, Code
+from data_diff.queries.ast_classes import BinBoolOp
 from data_diff.queries.extras import ApplyFuncAndNormalizeAsString, NormalizeAsString
 
 logger = logging.getLogger("table_segment")
@@ -155,13 +156,17 @@ class TableSegment:
     def get_schema(self) -> Dict[str, RawColumnInfo]:
         return self.database.query_table_schema(self.table_path)
 
+    def _key_range_expr(self, key_column: str) -> Expr:
+        coltype = self._schema[key_column] if self._schema else None
+        return self.database.dialect.key_range_expr(this[key_column], coltype)
+
     def _make_key_range(self):
         if self.min_key is not None:
             for mn, k in safezip(self.min_key, self.key_columns):
-                yield mn <= this[k]
+                yield BinBoolOp(">=", [self._key_range_expr(k), mn])
         if self.max_key is not None:
             for k, mx in safezip(self.key_columns, self.max_key):
-                yield this[k] < mx
+                yield BinBoolOp("<", [self._key_range_expr(k), mx])
 
     def _make_update_range(self):
         if self.min_update is not None:

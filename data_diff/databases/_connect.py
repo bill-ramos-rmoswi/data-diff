@@ -261,7 +261,7 @@ class Connect:
             >>> connect({"driver": "mysql", "host": "localhost", "database": "db"})
             <data_diff.databases.mysql.MySQL object at ...>
         """
-        cache_key = self.__make_cache_key(db_conf)
+        cache_key = (self.__make_cache_key(db_conf), thread_count)
         if shared:
             with suppress(KeyError):
                 conn = self.conn_cache[cache_key]

@@ -15,7 +15,7 @@ services:
       # Compose service names, not localhost. SQL Server uses its container port here.
       DATADIFF_POSTGRESQL_URI: postgresql://postgres:Password1@postgres/postgres
       DATADIFF_MYSQL_URI: mysql://mysql:Password1@mysql/mysql
-      DATADIFF_MSSQL_URI: mssql://sa:Password1@mssql:1433/testdb/dbo
+      DATADIFF_MSSQL_URI: mssql://sa:Password1@mssql:1433/testdb/dbo?TrustServerCertificate=yes
       DATADIFF_DB2_URI: db2://db2inst1:Password1@db2:50000/testdb/db2inst1
     networks:
       - local

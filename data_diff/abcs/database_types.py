@@ -229,6 +229,8 @@ class String_UUID(ColType_UUID, StringType):
     # None means we do not know for sure, behave as with False, but it might be unreliable.
     lowercase: Optional[bool] = None
     uppercase: Optional[bool] = None
+    # Set when compared with a native UUID, which has no case.
+    ignore_case: bool = False
 
     def make_value(self, v: str) -> ArithUUID:
         return self.python_type(v, lowercase=self.lowercase, uppercase=self.uppercase)
