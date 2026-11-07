@@ -207,6 +207,10 @@ class StringType(ColType):
     collation: Optional[Collation] = attrs.field(default=None, kw_only=True)
 
 
+class LongText(str):
+    """Marks a text column that may hold long values, so it can't be part of a key."""
+
+
 @attrs.define(frozen=True)
 class ColType_UUID(ColType, IKey):
     python_type = ArithUUID
@@ -219,7 +223,9 @@ class ColType_Alphanum(ColType, IKey):
 
 @attrs.define(frozen=True)
 class Native_UUID(ColType_UUID):
-    pass
+    def make_value(self, v) -> ArithUUID:
+        # A native UUID has no case, so drop any casing kept from a string UUID on the other side.
+        return self.python_type(v)
 
 
 @attrs.define(frozen=True)

@@ -1,7 +1,7 @@
 import abc
 import functools
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import sys
 import logging
@@ -84,6 +84,7 @@ from data_diff.abcs.database_types import (
     String_VaryingAlphanum,
     TemporalType,
     UnknownColType,
+    LongText,
     TimestampTZ,
     Text,
     DbTime,
@@ -671,6 +672,9 @@ class BaseDialect(abc.ABC):
 
     def timestamp_value(self, t: DbTime) -> str:
         "Provide SQL for the given timestamp value"
+        # Stored timestamps are treated as UTC, and a plain timestamp column ignores an offset in a literal
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
         return f"'{t.isoformat()}'"
 
     def random(self) -> str:
@@ -721,6 +725,8 @@ class BaseDialect(abc.ABC):
             return t
         elif isinstance(t, TimestampTZ):
             return f"TIMESTAMP({min(t.precision, DEFAULT_DATETIME_PRECISION)})"
+        if t is LongText:
+            return self.type_repr(str)
         return {
             int: "INT",
             str: "VARCHAR",

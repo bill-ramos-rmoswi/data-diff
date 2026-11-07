@@ -1,3 +1,4 @@
+from datetime import timezone
 from typing import Any, ClassVar, Dict, List, Optional, Type
 
 import attrs
@@ -11,6 +12,7 @@ from data_diff.abcs.database_types import (
     Float,
     FractionalType,
     Integer,
+    LongText,
     TemporalType,
     Text,
     Time,
@@ -103,12 +105,15 @@ class Dialect(BaseDialect):
 
     def type_repr(self, t) -> str:
         try:
-            return {str: "VARCHAR(4000)", float: "DOUBLE"}[t]
+            return {str: "VARCHAR(4000)", LongText: "CLOB", float: "DOUBLE"}[t]
         except KeyError:
             return super().type_repr(t)
 
     def timestamp_value(self, t: DbTime) -> str:
-        return f"TIMESTAMP('{t.replace(tzinfo=None).isoformat(sep=' ')}')"
+        # TIMESTAMP has no time zone, so a value with one must be converted, not just stripped of it
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+        return f"TIMESTAMP('{t.isoformat(sep=' ')}')"
 
     def explain_as_text(self, query: str) -> str:
         raise NotImplementedError("Db2 explains a query into tables, not as text.")
@@ -149,6 +154,10 @@ class Dialect(BaseDialect):
         if coltype.rounds and precision < 6:
             half_of_last_digit = 5 * 10 ** (5 - precision)
             value = f"({value} + {half_of_last_digit} MICROSECONDS)"
+        elif coltype.rounds:
+            # TIMESTAMP(7) and above must round too, and half a microsecond isn't a valid duration
+            seventh_digit = f"SUBSTR(VARCHAR_FORMAT({value}, 'FF7'), 7, 1)"
+            value = f"({value} + (CASE WHEN {seventh_digit} >= '5' THEN 1 ELSE 0 END) MICROSECONDS)"
 
         timestamp6 = f"VARCHAR_FORMAT({value}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
         return f"RPAD(LEFT({timestamp6}, {TIMESTAMP_PRECISION_POS + precision}), {TIMESTAMP_PRECISION_POS + 6}, '0')"
@@ -156,9 +165,16 @@ class Dialect(BaseDialect):
     def normalize_number(self, value: str, coltype: FractionalType) -> str:
         precision = coltype.precision
         if isinstance(coltype, Float):
-            # Going through DECFLOAT keeps the digits of the shortest decimal form.
-            # DOUBLE cast directly to DECIMAL truncates.
-            value = f"DECFLOAT({value})"
+            # Going through DECFLOAT keeps the digits of the shortest decimal form, because DOUBLE
+            # cast directly to DECIMAL truncates. Other databases use DECIMAL(38, precision), and
+            # a Db2 DECIMAL has only 31 digits, which would overflow for large values.
+            number = f"DECFLOAT({value})"
+            whole_digits = 38 - precision
+            number_format = "9" * (whole_digits - 1) + "0" + ("." + "0" * precision if precision else "")
+            # Adding zero turns a rounded -0 into 0, which VARCHAR_FORMAT rejects
+            fixed = f"LTRIM(VARCHAR_FORMAT(ROUND({number}, {precision}) + DECFLOAT(0), '{number_format}'))"
+            # VARCHAR_FORMAT renders a value that doesn't fit as #####, and those would all hash the same
+            return f"CASE WHEN ABS({number}) < 1E{whole_digits} THEN {fixed} ELSE VARCHAR({number}) END"
 
         # ROUND because casting to DECIMAL also truncates. 31 is the most digits a DECIMAL can have.
         number = f"VARCHAR(CAST(ROUND({value}, {precision}) AS DECIMAL(31, {precision})))"
@@ -234,7 +250,7 @@ class Db2(ThreadedDatabase):
         # for floating point, so those are translated to the binary precision that's expected.
         return (
             "SELECT COLNAME, TYPENAME, "
-            "CASE WHEN TYPENAME = 'TIMESTAMP' THEN SCALE END, "
+            "CASE WHEN TYPENAME IN ('TIMESTAMP', 'TIME') THEN SCALE END, "
             "CASE WHEN TYPENAME = 'DOUBLE' THEN 53 "
             "WHEN TYPENAME = 'REAL' THEN 24 "
             "WHEN TYPENAME = 'DECFLOAT' AND LENGTH = 8 THEN 53 "
@@ -252,5 +268,14 @@ class Db2(ThreadedDatabase):
         sql_code += " " * sum(ord(char) > 0xFFFF for char in sql_code)
         try:
             return super()._query_cursor(c, sql_code)
-        except self._db2.Error as e:
+        except Exception as e:  # ibm_db_dbi raises a plain Exception when a fetch fails
+            # A failed fetch keeps its transaction open despite autocommit, and that transaction
+            # keeps the table locked, which blocks DROP TABLE
+            c.close()
+            self.thread_local.conn.rollback()
+            if "SQL0433N" in str(e):
+                raise QueryError(
+                    f"{e}\nDb2 can only hash text up to 32,672 bytes, and CLOB columns can hold more. "
+                    "Remove the column from extra_columns, or compare it some other way."
+                )
             raise QueryError(e)

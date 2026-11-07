@@ -19,6 +19,7 @@ from data_diff.abcs.database_types import (
     ColType_UUID,
     FractionalType,
     Timestamp,
+    LongText,
     TimestampTZ,
     DbPath,
     Float,
@@ -125,7 +126,14 @@ class Dialect(BaseDialect):
     def type_repr(self, t) -> str:
         try:
             # TIMESTAMP means a row version in SQL Server, not a point in time
-            return {bool: "bit", str: "NVARCHAR(4000)", datetime: "DATETIME2(6)", float: "FLOAT"}[t]
+            return {
+                bool: "bit",
+                # NVARCHAR(MAX) can't be part of a key
+                str: "NVARCHAR(4000)",
+                LongText: "NVARCHAR(MAX)",
+                datetime: "DATETIME2(6)",
+                float: "FLOAT",
+            }[t]
         except KeyError:
             return super().type_repr(t)
 
@@ -179,7 +187,11 @@ class Dialect(BaseDialect):
 
         precision = coltype.precision
         if isinstance(coltype, Time):
-            return f"CONVERT(VARCHAR(15), CAST(CAST({value} AS TIME({precision})) AS TIME(6)))"
+            if coltype.rounds:
+                return f"CONVERT(VARCHAR(15), CAST(CAST({value} AS TIME({precision})) AS TIME(6)))"
+            time7 = f"CONVERT(VARCHAR(16), CAST({value} AS TIME(7)))"
+            digits = min(precision, 6)
+            return f"LEFT({time7}, {len('12:24:35.') + digits}) + REPLICATE('0', {6 - digits})"
 
         if isinstance(coltype, TimestampTZ):
             value = f"SWITCHOFFSET({value}, '+00:00')"
@@ -188,8 +200,10 @@ class Dialect(BaseDialect):
             # Casting to a lower-precision DATETIME2 rounds. Style 121 keeps all 6 digits of DATETIME2(6).
             return f"CONVERT(VARCHAR(26), CAST(CAST({value} AS DATETIME2({precision})) AS DATETIME2(6)), 121)"
 
-        timestamp6 = f"CONVERT(VARCHAR(26), CAST({value} AS DATETIME2(6)), 121)"
-        return f"LEFT({timestamp6}, {TIMESTAMP_PRECISION_POS + precision}) + REPLICATE('0', {6 - precision})"
+        # The other side truncated. Casting to DATETIME2(6) would round, so keep all the digits to cut them.
+        timestamp7 = f"CONVERT(VARCHAR(27), CAST({value} AS DATETIME2(7)), 121)"
+        digits = min(precision, 6)
+        return f"LEFT({timestamp7}, {TIMESTAMP_PRECISION_POS + digits}) + REPLICATE('0', {6 - digits})"
 
     def normalize_number(self, value: str, coltype: FractionalType) -> str:
         if isinstance(coltype, Float):
@@ -281,14 +295,15 @@ class MsSQL(ThreadedDatabase):
     def select_table_schema(self, path: DbPath) -> str:
         """Provide SQL for selecting the table schema as (name, type, date_prec, num_prec)"""
         database, schema, name = self._normalize_table_path(path)
-        info_schema_path = ["information_schema", "columns"]
+        # In uppercase, because a database with a case-sensitive collation is strict about these names
+        info_schema_path = ["INFORMATION_SCHEMA", "COLUMNS"]
         if database:
             info_schema_path.insert(0, self.dialect.quote(database))
 
         return (
-            "SELECT column_name, data_type, datetime_precision, numeric_precision, numeric_scale, collation_name "
+            "SELECT COLUMN_NAME, DATA_TYPE, DATETIME_PRECISION, NUMERIC_PRECISION, NUMERIC_SCALE, COLLATION_NAME "
             f"FROM {'.'.join(info_schema_path)} "
-            f"WHERE table_name = '{name}' AND table_schema = '{schema}'"
+            f"WHERE TABLE_NAME = '{name}' AND TABLE_SCHEMA = '{schema}'"
         )
 
     def _normalize_table_path(self, path: DbPath) -> DbPath:

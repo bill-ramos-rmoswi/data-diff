@@ -65,6 +65,8 @@ def create_temp_table(c: Compiler, path: TablePath, expr: Expr) -> str:
         return f"create global temporary table {c.dialect.compile(c, path)} as {c.dialect.compile(c, expr)}"
     elif isinstance(db, Db2):
         return f"create table {c.dialect.compile(c, path)} as ({c.dialect.compile(c, expr)}) with data"
+    elif isinstance(db, MsSQL):
+        return f"select * into {c.dialect.compile(c, path)} from ({c.dialect.compile(c, expr)}) as source"
     else:
         return f"create temporary table {c.dialect.compile(c, path)} as {c.dialect.compile(c, expr)}"
 
@@ -244,7 +246,7 @@ class JoinDiffer(TableDiffer):
                 logger.info(f"Validating that the are no duplicate keys in columns: {unvalidated} for {ts.table_path}")
                 # Validate that there are no duplicate keys
                 self.stats["validated_unique_keys"] = self.stats.get("validated_unique_keys", []) + [unvalidated]
-                q = t.select(total=Count(), total_distinct=Count(Concat(this[unvalidated]), distinct=True))
+                q = t.select(total=Count(), total_distinct=Count(Concat(this[unvalidated], sep="|"), distinct=True))
                 total, total_distinct = ts.database.query(q, tuple, log_message=ts.table_path)
                 if total != total_distinct:
                     raise ValueError("Duplicate primary keys")
@@ -378,22 +380,29 @@ class JoinDiffer(TableDiffer):
 
         logger.info("Counting and sampling exclusive rows")
 
-        def exclusive_rows(expr):
-            c = Compiler(db)
-            name = c.new_unique_table_name("temp_table")
-            exclusive_rows = table(name, schema=expr.source_table.schema)
+        c = Compiler(db)
+        name = c.new_unique_table_name("temp_table")
+        exclusive_rows = table(name, schema=exclusive_rows_query.source_table.schema)
+
+        def sample_exclusive_rows(expr):
             yield Code(create_temp_table(c, exclusive_rows, expr.limit(self.table_write_limit)))
 
             count = yield exclusive_rows.count()
             self.stats["exclusive_count"] = self.stats.get("exclusive_count", 0) + count[0][0]
             sample_rows = yield sample(exclusive_rows.select(*this[list(a_cols)], *this[list(b_cols)]))
-            self.stats["exclusive_sample"] = self.stats.get("exclusive_sample", []) + sample_rows
+            self.stats["exclusive_sample"] = self.stats.get("exclusive_sample", []) + list(sample_rows)
 
             # Only drops if create table succeeded (meaning, the table didn't already exist)
             yield exclusive_rows.drop()
 
         # Run as a sequence of thread-local queries (compiled into a ThreadLocalInterpreter)
-        db.query(exclusive_rows(exclusive_rows_query), None)
+        try:
+            db.query(sample_exclusive_rows(exclusive_rows_query), None)
+        except Exception:
+            # These tables are permanent, so a failure would leave them behind
+            if isinstance(db, (Db2, MsSQL)):
+                db.query(exclusive_rows.drop(if_exists=True), None)
+            raise
 
     def _materialize_diff(self, db, diff_rows, segment_index=None):
         assert self.materialize_to_table

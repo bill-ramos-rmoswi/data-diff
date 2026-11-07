@@ -2,7 +2,7 @@
 
 from contextlib import suppress
 
-from data_diff.abcs.database_types import DbPath
+from data_diff.abcs.database_types import DbPath, LongText
 from data_diff.databases.base import QueryError
 from data_diff.databases.oracle import Oracle
 from data_diff.queries.api import table, commit, Expr
@@ -44,7 +44,9 @@ def _append_to_table_oracle(path: DbPath, expr: Expr):
 def _append_to_table(path: DbPath, expr: Expr):
     """Append to table"""
     assert expr.schema, expr
-    t = table(path, schema=expr.schema)
+    # Normalized values can be as long as the column they came from
+    schema = {name: LongText if type_ is str else type_ for name, type_ in expr.schema.items()}
+    t = table(path, schema=schema)
     yield t.create(if_not_exists=True)  # uses expr.schema
     yield commit
     yield t.insert_expr(expr)

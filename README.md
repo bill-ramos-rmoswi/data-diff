@@ -49,7 +49,9 @@ A SQL Server URI looks like `mssql://user:password@host:1433/database/schema`. A
 Things to check before your first run:
 
 - Db2 table and column names are case-sensitive, and Db2 stores unquoted names in uppercase.
-- Db2 numbers are limited to 31 digits.
+- Db2 `DECIMAL` columns hold up to 31 digits.
+- Db2 can't compare text longer than 32,672 bytes, or a row of compared text longer than that, because its `HASH` function doesn't accept a `CLOB`. The diff stops with an error, so remove long columns from `extra_columns`.
+- Float values with more than 15 significant digits can show as different against PostgreSQL, which keeps only 15 when it converts a float to a decimal. Floats of 1E25 or more can't be compared across databases at the default precision.
 - SQL Server `uniqueidentifier` keys compare more slowly, because those filters can't use an index.
 - Checksums scan the tables you compare, so start with a small table, off-peak.
 
