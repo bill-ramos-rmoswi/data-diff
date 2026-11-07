@@ -672,9 +672,10 @@ class BaseDialect(abc.ABC):
 
     def timestamp_value(self, t: DbTime) -> str:
         "Provide SQL for the given timestamp value"
-        # Stored timestamps are treated as UTC, and a plain timestamp column ignores an offset in a literal
+        # Stored timestamps are treated as UTC. A plain timestamp column ignores the offset in a literal,
+        # and one with a time zone needs it, because not every connection in a pool has its zone set to UTC.
         if t.tzinfo is not None:
-            t = t.astimezone(timezone.utc).replace(tzinfo=None)
+            t = t.astimezone(timezone.utc)
         return f"'{t.isoformat()}'"
 
     def random(self) -> str:

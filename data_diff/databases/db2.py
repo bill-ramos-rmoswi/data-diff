@@ -1,3 +1,4 @@
+from contextlib import suppress
 from datetime import timezone
 from typing import Any, ClassVar, Dict, List, Optional, Type
 
@@ -151,13 +152,15 @@ class Dialect(BaseDialect):
 
         # TIMESTAMP goes up to 12 digits, and we compare at most 6
         precision = min(coltype.precision, 6)
-        if coltype.rounds and precision < 6:
-            half_of_last_digit = 5 * 10 ** (5 - precision)
-            value = f"({value} + {half_of_last_digit} MICROSECONDS)"
-        elif coltype.rounds:
-            # TIMESTAMP(7) and above must round too, and half a microsecond isn't a valid duration
-            seventh_digit = f"SUBSTR(VARCHAR_FORMAT({value}, 'FF7'), 7, 1)"
-            value = f"({value} + (CASE WHEN {seventh_digit} >= '5' THEN 1 ELSE 0 END) MICROSECONDS)"
+        if coltype.rounds:
+            if precision < 6:
+                rounding = f"{5 * 10 ** (5 - precision)} MICROSECONDS"
+            else:
+                # TIMESTAMP(7) and above must round too, and half a microsecond isn't a valid duration
+                seventh_digit = f"SUBSTR(VARCHAR_FORMAT({value}, 'FF7'), 7, 1)"
+                rounding = f"(CASE WHEN {seventh_digit} >= '5' THEN 1 ELSE 0 END) MICROSECONDS"
+            # Rounding up the last second of 9999, often used to mean "no end date", would overflow
+            value = f"CASE WHEN {value} < TIMESTAMP('9999-12-31-23.59.59') THEN {value} + {rounding} ELSE {value} END"
 
         timestamp6 = f"VARCHAR_FORMAT({value}, 'YYYY-MM-DD HH24:MI:SS.FF6')"
         return f"RPAD(LEFT({timestamp6}, {TIMESTAMP_PRECISION_POS + precision}), {TIMESTAMP_PRECISION_POS + 6}, '0')"
@@ -174,7 +177,7 @@ class Dialect(BaseDialect):
             # Adding zero turns a rounded -0 into 0, which VARCHAR_FORMAT rejects
             fixed = f"LTRIM(VARCHAR_FORMAT(ROUND({number}, {precision}) + DECFLOAT(0), '{number_format}'))"
             # VARCHAR_FORMAT renders a value that doesn't fit as #####, and those would all hash the same
-            return f"CASE WHEN ABS({number}) < 1E{whole_digits} THEN {fixed} ELSE VARCHAR({number}) END"
+            return f"CASE WHEN ABS({number}) < 1E{whole_digits} THEN {fixed} ELSE VARCHAR(NORMALIZE_DECFLOAT({number})) END"
 
         # ROUND because casting to DECIMAL also truncates. 31 is the most digits a DECIMAL can have.
         number = f"VARCHAR(CAST(ROUND({value}, {precision}) AS DECIMAL(31, {precision})))"
@@ -271,8 +274,9 @@ class Db2(ThreadedDatabase):
         except Exception as e:  # ibm_db_dbi raises a plain Exception when a fetch fails
             # A failed fetch keeps its transaction open despite autocommit, and that transaction
             # keeps the table locked, which blocks DROP TABLE
-            c.close()
-            self.thread_local.conn.rollback()
+            for release in (c.close, self.thread_local.conn.rollback):
+                with suppress(Exception):  # The original error is the one to report
+                    release()
             if "SQL0433N" in str(e):
                 raise QueryError(
                     f"{e}\nDb2 can only hash text up to 32,672 bytes, and CLOB columns can hold more. "

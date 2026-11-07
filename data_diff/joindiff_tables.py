@@ -4,6 +4,7 @@ from decimal import Decimal
 from functools import partial
 import logging
 from typing import List, Optional
+from contextlib import suppress
 from itertools import chain
 
 import attrs
@@ -23,7 +24,7 @@ from data_diff.queries.api import (
     this,
     when,
 )
-from data_diff.queries.ast_classes import Concat, Count, Expr, Random, TablePath, Code, ITable
+from data_diff.queries.ast_classes import Count, Expr, Random, TablePath, Code, ITable
 from data_diff.queries.extras import NormalizeAsString
 from data_diff.info_tree import InfoTree
 from data_diff.query_utils import append_to_table, drop_table
@@ -246,8 +247,9 @@ class JoinDiffer(TableDiffer):
                 logger.info(f"Validating that the are no duplicate keys in columns: {unvalidated} for {ts.table_path}")
                 # Validate that there are no duplicate keys
                 self.stats["validated_unique_keys"] = self.stats.get("validated_unique_keys", []) + [unvalidated]
-                q = t.select(total=Count(), total_distinct=Count(Concat(this[unvalidated], sep="|"), distinct=True))
-                total, total_distinct = ts.database.query(q, tuple, log_message=ts.table_path)
+                distinct_keys = t.select(*this[unvalidated], distinct=True)
+                total = ts.database.query(t.count(), int, log_message=ts.table_path)
+                total_distinct = ts.database.query(distinct_keys.count(), int, log_message=ts.table_path)
                 if total != total_distinct:
                     raise ValueError("Duplicate primary keys")
 
@@ -381,7 +383,8 @@ class JoinDiffer(TableDiffer):
         logger.info("Counting and sampling exclusive rows")
 
         c = Compiler(db)
-        name = c.new_unique_table_name("temp_table")
+        # A # name makes it a real temporary table on SQL Server, which needs no extra permissions
+        name = c.new_unique_table_name("#temp_table" if isinstance(db, MsSQL) else "temp_table")
         exclusive_rows = table(name, schema=exclusive_rows_query.source_table.schema)
 
         def sample_exclusive_rows(expr):
@@ -399,9 +402,10 @@ class JoinDiffer(TableDiffer):
         try:
             db.query(sample_exclusive_rows(exclusive_rows_query), None)
         except Exception:
-            # These tables are permanent, so a failure would leave them behind
-            if isinstance(db, (Db2, MsSQL)):
-                db.query(exclusive_rows.drop(if_exists=True), None)
+            # This table is permanent on Db2, so a failure would leave it behind
+            if isinstance(db, Db2):
+                with suppress(Exception):  # The original error is the one to report
+                    db.query(exclusive_rows.drop(if_exists=True), None)
             raise
 
     def _materialize_diff(self, db, diff_rows, segment_index=None):

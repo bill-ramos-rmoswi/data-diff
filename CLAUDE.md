@@ -77,7 +77,7 @@ poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, wri
 - **A failed Db2 fetch keeps its table locked.** It raises a plain `Exception`, not `ibm_db.Error`, and the transaction stays open despite autocommit, so `_query_cursor` rolls back.
 - **Db2 `HASH` rejects `CLOB`.** `VARCHAR(x)` raises an error above 32,672 bytes, while `CAST(x AS VARCHAR(n))` truncates silently, so never use the cast for hashing.
 - **Db2 `VARCHAR_FORMAT` renders a number that doesn't fit as `####`.** Those values all hash the same, so `normalize_number` checks the range first.
-- **`coltype.rounds` applies to `TIME` too.** Every dialect must truncate when it's false, and a truncating side can be the lowest precision at 7 digits, so cap at 6.
+- **`coltype.rounds` applies to `TIME` too.** PostgreSQL, SQL Server and Db2 truncate when it's false, but Snowflake and BigQuery still round. A truncating side can be the lowest precision at 7 digits, so cap at 6.
 - **SQL Server `uniqueidentifier` doesn't sort like a string**, and renders in uppercase. Key ranges compare it through `key_range_expr`, which can't use an index, so these keys are slower.
 - **Locale collations hide casing bugs.** PostgreSQL's default sort ignores case, so test string keys on a binary collation too. Db2 and DuckDB use one.
 - **Close API connections.** PostgreSQL connections from `connect_to_table` stay in a transaction, which blocks `DROP TABLE`. Call `segment.database.close()` when done.

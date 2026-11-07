@@ -96,6 +96,11 @@ class TestMsSQLAgainstDb2(TypeTestCase):
         db2 = self.table(db.Db2, "TIME", "'12:00:00'", "'12:00:00'")
         self.assert_both_directions((db.MsSQL, ms), (db.Db2, db2))
 
+    def test_end_of_time_timestamp_can_round(self):
+        ms = self.table(db.MsSQL, "DATETIME2(3)", "'9999-12-31 23:59:59.999'")
+        db2 = self.table(db.Db2, "TIMESTAMP(6)", "'9999-12-31-23.59.59.999999'")
+        self.assert_both_directions((db.MsSQL, ms), (db.Db2, db2))
+
     def test_large_float(self):
         ms = self.table(db.MsSQL, "FLOAT", "1e18", "-0.5")
         db2 = self.table(db.Db2, "DOUBLE", "1e18", "-0.5")
@@ -147,6 +152,11 @@ class TestDb2(TypeTestCase):
     def test_decfloat34(self):
         a = self.table(db.Db2, "DECFLOAT(34)", "0.5", "1234567.25", name="value_a")
         b = self.table(db.Db2, "DECFLOAT(34)", "0.5", "1234567.25", name="value_b")
+        self.assertEqual([], self.diff((db.Db2, a), (db.Db2, b)))
+
+    def test_equal_decfloats_with_different_trailing_zeros(self):
+        a = self.table(db.Db2, "DECFLOAT(34)", "DECFLOAT('1234567.25')", name="value_a")
+        b = self.table(db.Db2, "DECFLOAT(34)", "DECFLOAT('1234567.250')", name="value_b")
         self.assertEqual([], self.diff((db.Db2, a), (db.Db2, b)))
 
     def test_decfloat_nan_and_infinity(self):
@@ -225,7 +235,7 @@ class TestValues(unittest.TestCase):
     def test_other_databases_convert_a_timestamp_to_utc(self):
         value = datetime(2024, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
         for dialect in (MsSQLDialect(), PostgresqlDialect()):
-            self.assertEqual("'2024-01-01T05:00:00'", dialect.timestamp_value(value))
+            self.assertEqual("'2024-01-01T05:00:00+00:00'", dialect.timestamp_value(value))
 
     def test_db2_keeps_a_timestamp_without_a_time_zone(self):
         self.assertEqual("TIMESTAMP('2024-01-01 00:00:00')", Db2Dialect().timestamp_value(datetime(2024, 1, 1)))
