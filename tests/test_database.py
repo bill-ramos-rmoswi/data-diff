@@ -31,6 +31,7 @@ TEST_DATABASES = {
     dbs.Trino,
     dbs.Vertica,
     dbs.MsSQL,
+    dbs.Db2,
 }
 
 test_each_database: Callable = test_each_database_in_list(TEST_DATABASES)
@@ -71,7 +72,7 @@ class TestQueries(unittest.TestCase):
         assert isinstance(res, datetime), (res, type(res))
 
     def test_correct_timezone(self):
-        if self.db_cls in [dbs.MsSQL]:
+        if self.db_cls in [dbs.MsSQL, dbs.Db2]:
             self.skipTest("No support for session tz.")
         name = "tbl_" + random_table_suffix()
 
@@ -194,7 +195,7 @@ class TestCloseMethod(unittest.TestCase):
 
         # Perform a query to verify the connection is established
         with database:
-            database.query("SELECT 1")
+            database.query(current_timestamp(), datetime)
 
         # Now the connection should be closed, and trying to execute a query should fail.
         with self.assertRaises(Exception):  # Catch any type of exception.

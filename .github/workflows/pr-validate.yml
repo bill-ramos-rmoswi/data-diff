@@ -1,0 +1,98 @@
+name: PR validation
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  POETRY_VERSION: "1.8.5"
+  # pipx runs Poetry on the system Python, which it would otherwise use for the project too
+  POETRY_VIRTUALENVS_PREFER_ACTIVE_PYTHON: "true"
+
+jobs:
+  format:
+    name: Check formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Poetry
+        run: pipx install "poetry==$POETRY_VERSION"
+      - name: Install dependencies
+        run: poetry install --no-root
+      - name: Run ruff
+        run: poetry run ruff format --check .
+
+  unit:
+    name: Unit tests on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Start databases
+        run: docker compose up -d --wait --wait-timeout 120 postgres mysql
+      - name: Install Poetry
+        run: pipx install "poetry==$POETRY_VERSION"
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev unixodbc-dev
+      - name: Install dependencies
+        run: poetry install
+      - name: Run tests
+        env:
+          TEST_ACROSS_ALL_DBS: "0"
+        run: poetry run unittest-parallel -j 4
+
+  integration:
+    name: Db2, SQL Server and PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Standard runners have 16 GB of memory
+      DB2_MEM: 6g
+      MSSQL_MEM: 3g
+      POSTGRES_MEM: 2g
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start databases
+        run: docker compose up -d --wait --wait-timeout 600 postgres mysql mssql db2
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 libpq-dev unixodbc-dev
+      - name: Install Poetry
+        run: pipx install "poetry==$POETRY_VERSION"
+      - name: Install dependencies
+        run: poetry install
+      - name: Run tests across every pair of databases
+        env:
+          TEST_ACROSS_ALL_DBS: full
+          DATADIFF_MSSQL_URI: "mssql://sa:Password1@localhost:14330/testdb/dbo?TrustServerCertificate=yes"
+          DATADIFF_DB2_URI: "db2://db2inst1:Password1@localhost:50000/testdb/db2inst1"
+        run: poetry run unittest-parallel -j 4
+      - name: Show database logs
+        if: failure()
+        run: docker compose logs --tail 100

@@ -24,6 +24,7 @@ from data_diff.databases.clickhouse import Clickhouse
 from data_diff.databases.vertica import Vertica
 from data_diff.databases.duckdb import DuckDB
 from data_diff.databases.mssql import MsSQL
+from data_diff.databases.db2 import Db2
 
 
 @attrs.frozen
@@ -90,6 +91,7 @@ DATABASE_BY_SCHEME = {
     "clickhouse": Clickhouse,
     "vertica": Vertica,
     "mssql": MsSQL,
+    "db2": Db2,
 }
 
 
@@ -134,6 +136,8 @@ class Connect:
         - clickhouse
         - vertica
         - duckdb
+        - mssql
+        - db2
         """
 
         dsn = dsnparse.parse(db_uri)
@@ -254,6 +258,8 @@ class Connect:
         - trino
         - clickhouse
         - vertica
+        - mssql
+        - db2
 
         Example:
             >>> connect("mysql://localhost/db")
@@ -261,7 +267,7 @@ class Connect:
             >>> connect({"driver": "mysql", "host": "localhost", "database": "db"})
             <data_diff.databases.mysql.MySQL object at ...>
         """
-        cache_key = self.__make_cache_key(db_conf)
+        cache_key = (self.__make_cache_key(db_conf), thread_count)
         if shared:
             with suppress(KeyError):
                 conn = self.conn_cache[cache_key]

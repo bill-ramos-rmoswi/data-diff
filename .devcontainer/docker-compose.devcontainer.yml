@@ -1,0 +1,24 @@
+# Adds the development container to the stack in ../docker-compose.yml.
+# Relative paths resolve from the repo root, the directory of that first file.
+services:
+  dev:
+    container_name: dd-dev
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    command: sleep infinity
+    volumes:
+      - .:/workspaces/data-diff:cached
+      - claude-config:/home/vscode/.claude
+    environment:
+      CLAUDE_CONFIG_DIR: /home/vscode/.claude
+      # Compose service names, not localhost. SQL Server uses its container port here.
+      DATADIFF_POSTGRESQL_URI: postgresql://postgres:Password1@postgres/postgres
+      DATADIFF_MYSQL_URI: mysql://mysql:Password1@mysql/mysql
+      DATADIFF_MSSQL_URI: mssql://sa:Password1@mssql:1433/testdb/dbo?TrustServerCertificate=yes
+      DATADIFF_DB2_URI: db2://db2inst1:Password1@db2:50000/testdb/db2inst1
+    networks:
+      - local
+
+volumes:
+  claude-config:

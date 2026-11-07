@@ -1,0 +1,24 @@
+{
+  "name": "data-diff",
+  "dockerComposeFile": ["../docker-compose.yml", "docker-compose.devcontainer.yml"],
+  "service": "dev",
+  "runServices": ["dev", "postgres", "mysql", "mssql", "db2"],
+  "workspaceFolder": "/workspaces/data-diff",
+  "remoteUser": "vscode",
+  // Keeps the databases running across window reloads. Stop them from WSL with `docker compose down`.
+  "shutdownAction": "none",
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "postCreateCommand": "poetry install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"],
+      "settings": {
+        "python.testing.unittestEnabled": true,
+        "python.testing.pytestEnabled": false
+      }
+    }
+  }
+}

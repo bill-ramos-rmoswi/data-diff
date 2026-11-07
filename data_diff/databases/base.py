@@ -1,7 +1,7 @@
 import abc
 import functools
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import sys
 import logging
@@ -84,6 +84,7 @@ from data_diff.abcs.database_types import (
     String_VaryingAlphanum,
     TemporalType,
     UnknownColType,
+    LongText,
     TimestampTZ,
     Text,
     DbTime,
@@ -671,6 +672,10 @@ class BaseDialect(abc.ABC):
 
     def timestamp_value(self, t: DbTime) -> str:
         "Provide SQL for the given timestamp value"
+        # Stored timestamps are treated as UTC. A plain timestamp column ignores the offset in a literal,
+        # and one with a time zone needs it, because not every connection in a pool has its zone set to UTC.
+        if t.tzinfo is not None:
+            t = t.astimezone(timezone.utc)
         return f"'{t.isoformat()}'"
 
     def random(self) -> str:
@@ -721,6 +726,8 @@ class BaseDialect(abc.ABC):
             return t
         elif isinstance(t, TimestampTZ):
             return f"TIMESTAMP({min(t.precision, DEFAULT_DATETIME_PRECISION)})"
+        if t is LongText:
+            return self.type_repr(str)
         return {
             int: "INT",
             str: "VARCHAR",
@@ -884,7 +891,10 @@ class BaseDialect(abc.ABC):
         elif isinstance(coltype, FractionalType):
             return self.normalize_number(value, coltype)
         elif isinstance(coltype, ColType_UUID):
-            return self.normalize_uuid(value, coltype)
+            normalized = self.normalize_uuid(value, coltype)
+            if isinstance(coltype, String_UUID) and coltype.ignore_case:
+                return f"LOWER({normalized})"
+            return normalized
         elif isinstance(coltype, Boolean):
             return self.normalize_boolean(value, coltype)
         elif isinstance(coltype, JSON):
@@ -894,6 +904,13 @@ class BaseDialect(abc.ABC):
         elif isinstance(coltype, Struct):
             return self.normalize_struct(value, coltype)
         return self.to_string(value)
+
+    def key_range_expr(self, column: Expr, coltype: Optional[ColType]) -> Expr:
+        """Returns the expression that key range filters should compare, for a key column.
+
+        Override this when a key type doesn't sort the same way as in other databases.
+        """
+        return column
 
     def optimizer_hints(self, hints: str) -> str:
         return f"/*+ {hints} */ "
@@ -1171,7 +1188,8 @@ class Database(abc.ABC):
         assert isinstance(sql_code, str), sql_code
         try:
             c.execute(sql_code)
-            if sql_code.lower().startswith(("select", "explain", "show")):
+            # SQL Server's SELECT ... INTO starts with SELECT, but returns no result set
+            if sql_code.lower().startswith(("select", "explain", "show")) and c.description is not None:
                 columns = [col[0] for col in c.description]
 
                 fetched = c.fetchall()

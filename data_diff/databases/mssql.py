@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, ClassVar, Dict, Optional, Type
 
 import attrs
@@ -5,16 +6,20 @@ import attrs
 from data_diff.databases.base import (
     CHECKSUM_HEXDIGITS,
     CHECKSUM_OFFSET,
+    TIMESTAMP_PRECISION_POS,
     QueryError,
     ThreadedDatabase,
     import_helper,
     ConnectError,
     BaseDialect,
+    Compiler,
 )
 from data_diff.abcs.database_types import (
     JSON,
-    NumericType,
+    ColType_UUID,
+    FractionalType,
     Timestamp,
+    LongText,
     TimestampTZ,
     DbPath,
     Float,
@@ -24,9 +29,13 @@ from data_diff.abcs.database_types import (
     Native_UUID,
     Text,
     Boolean,
+    ColType,
     Date,
     Time,
 )
+from data_diff.queries.ast_classes import Code, Concat, CreateTable, Expr
+from data_diff.queries.extras import NormalizeAsString
+from data_diff.utils import join_iter
 
 
 @import_helper("mssql")
@@ -82,6 +91,19 @@ class Dialect(BaseDialect):
     def quote(self, s: str) -> str:
         return f"[{s}]"
 
+    def _convert_db_precision_to_digits(self, p: int) -> int:
+        # Same reduction as PostgreSQL, so a REAL and a DOUBLE PRECISION holding
+        # the same number compare equal despite their binary rounding.
+        return max(super()._convert_db_precision_to_digits(p) - 2, 0)
+
+    def key_range_expr(self, column: Expr, coltype: Optional[ColType]) -> Expr:
+        if isinstance(coltype, Native_UUID):
+            # UNIQUEIDENTIFIER doesn't sort like a string (the last 6 bytes are the most
+            # significant), so comparing it directly selects different rows than other
+            # databases. Comparing the text is correct, but can't use an index.
+            return NormalizeAsString(column, coltype)
+        return column
+
     def set_timezone_to_utc(self) -> str:
         raise NotImplementedError("MsSQL does not support a session timezone setting.")
 
@@ -97,12 +119,21 @@ class Dialect(BaseDialect):
         WHERE name = CURRENT_USER"""
 
     def to_string(self, s: str) -> str:
-        # Both convert(varchar(max), …) and convert(text, …) do work.
-        return f"CONVERT(VARCHAR(MAX), {s})"
+        # NVARCHAR, because converting Unicode text to VARCHAR loses characters
+        # outside the database's code page.
+        return f"CONVERT(NVARCHAR(MAX), {s})"
 
     def type_repr(self, t) -> str:
         try:
-            return {bool: "bit", str: "text"}[t]
+            # TIMESTAMP means a row version in SQL Server, not a point in time
+            return {
+                bool: "bit",
+                # NVARCHAR(MAX) can't be part of a key
+                str: "NVARCHAR(4000)",
+                LongText: "NVARCHAR(MAX)",
+                datetime: "DATETIME2(6)",
+                float: "FLOAT",
+            }[t]
         except KeyError:
             return super().type_repr(t)
 
@@ -135,30 +166,95 @@ class Dialect(BaseDialect):
 
     def constant_values(self, rows) -> str:
         values = ", ".join("(%s)" % ", ".join(self._constant_value(v) for v in row) for row in rows)
-        return f"VALUES {values}"
+        # A plain VALUES clause allows at most 1000 rows, and a derived table has no such limit.
+        columns = ", ".join(f"c{i}" for i in range(len(rows[0])))
+        return f"SELECT * FROM (VALUES {values}) AS constant_values({columns})"
+
+    def render_createtable(self, c: Compiler, elem: CreateTable) -> str:
+        path = self.compile(c, elem.path)
+        if elem.source_table:
+            # SQL Server has no CREATE TABLE ... AS SELECT
+            statement = f"SELECT * INTO {path} FROM ({self.compile(c, elem.source_table)}) AS source"
+        else:
+            statement = super().render_createtable(c, attrs.evolve(elem, if_not_exists=False))
+
+        # SQL Server has no CREATE TABLE IF NOT EXISTS
+        return f"IF OBJECT_ID('{path}') IS NULL {statement}" if elem.if_not_exists else statement
 
     def normalize_timestamp(self, value: str, coltype: TemporalType) -> str:
-        if coltype.precision > 0:
-            formatted_value = (
-                f"FORMAT({value}, 'yyyy-MM-dd HH:mm:ss') + '.' + "
-                f"SUBSTRING(FORMAT({value}, 'fffffff'), 1, {coltype.precision})"
-            )
-        else:
-            formatted_value = f"FORMAT({value}, 'yyyy-MM-dd HH:mm:ss')"
+        if isinstance(coltype, Date):
+            return f"CONVERT(VARCHAR(10), {value}, 23)"
 
-        return formatted_value
+        precision = coltype.precision
+        if isinstance(coltype, Time):
+            if coltype.rounds:
+                return f"CONVERT(VARCHAR(15), CAST(CAST({value} AS TIME({precision})) AS TIME(6)))"
+            time7 = f"CONVERT(VARCHAR(16), CAST({value} AS TIME(7)))"
+            digits = min(precision, 6)
+            return f"LEFT({time7}, {len('12:24:35.') + digits}) + REPLICATE('0', {6 - digits})"
 
-    def normalize_number(self, value: str, coltype: NumericType) -> str:
-        if coltype.precision == 0:
-            return f"CAST(FLOOR({value}) AS VARCHAR)"
+        if isinstance(coltype, TimestampTZ):
+            value = f"SWITCHOFFSET({value}, '+00:00')"
 
-        return f"FORMAT({value}, 'N{coltype.precision}')"
+        if coltype.rounds:
+            # Casting to a lower-precision DATETIME2 rounds. Style 121 keeps all 6 digits of DATETIME2(6).
+            return f"CONVERT(VARCHAR(26), CAST(CAST({value} AS DATETIME2({precision})) AS DATETIME2(6)), 121)"
+
+        # The other side truncated. Casting to DATETIME2(6) would round, so keep all the digits to cut them.
+        timestamp7 = f"CONVERT(VARCHAR(27), CAST({value} AS DATETIME2(7)), 121)"
+        digits = min(precision, 6)
+        return f"LEFT({timestamp7}, {TIMESTAMP_PRECISION_POS + digits}) + REPLICATE('0', {6 - digits})"
+
+    def normalize_number(self, value: str, coltype: FractionalType) -> str:
+        if isinstance(coltype, Float):
+            # A REAL cast directly to DECIMAL keeps only 6 or 7 significant digits.
+            value = f"CAST({value} AS FLOAT)"
+        return f"CONVERT(VARCHAR(50), CAST({value} AS DECIMAL(38, {coltype.precision})))"
+
+    def normalize_uuid(self, value: str, coltype: ColType_UUID) -> str:
+        if isinstance(coltype, Native_UUID):
+            # SQL Server renders UNIQUEIDENTIFIER in uppercase, and other databases use lowercase.
+            return f"LOWER(CONVERT(CHAR(36), {value}))"
+        return super().normalize_uuid(value, coltype)
+
+    def normalize_value_by_type(self, value: str, coltype: ColType) -> str:
+        # NVARCHAR(MAX) makes checksums about 3 times slower, so only text pays for it
+        if isinstance(coltype, Integer):
+            return f"CONVERT(VARCHAR(50), {value})"
+        return super().normalize_value_by_type(value, coltype)
+
+    def render_concat(self, c: Compiler, elem: Concat) -> str:
+        if self._prevent_overflow_when_concat:
+            return super().render_concat(c, elem)
+
+        def as_string(expr) -> str:
+            # Checksums pass normalized strings, which to_string() would only slow down. Other
+            # callers pass raw columns, and coalesce() can't mix an INT with '<null>'.
+            compiled = self.compile(c, expr)
+            return compiled if isinstance(expr, (Code, NormalizeAsString)) else self.to_string(compiled)
+
+        items = [f"coalesce({as_string(expr)}, '<null>')" for expr in elem.exprs]
+        if len(items) == 1:
+            return items[0]
+        if elem.sep:
+            items = list(join_iter(f"'{elem.sep}'", items))
+        return self.concat(items)
+
+    def _hash_md5(self, s: str) -> str:
+        # Other databases hash UTF-8 bytes. HASHBYTES hashes the bytes of the value it receives,
+        # which would otherwise be UTF-16 or the database's code page.
+        utf8 = f"CONVERT(VARCHAR(MAX), CONVERT(NVARCHAR(MAX), {s}) COLLATE Latin1_General_100_BIN2_UTF8)"
+        return f"HASHBYTES('MD5', {utf8})"
 
     def md5_as_int(self, s: str) -> str:
-        return f"convert(bigint, convert(varbinary, '0x' + RIGHT(CONVERT(NVARCHAR(32), HashBytes('MD5', {s}), 2), {CHECKSUM_HEXDIGITS}), 1)) - {CHECKSUM_OFFSET}"
+        hex_digest = f"CONVERT(VARCHAR(32), {self._hash_md5(s)}, 2)"
+        return (
+            f"CONVERT(BIGINT, CONVERT(VARBINARY(8), '0x' + RIGHT({hex_digest}, {CHECKSUM_HEXDIGITS}), 1))"
+            f" - {CHECKSUM_OFFSET}"
+        )
 
     def md5_as_hex(self, s: str) -> str:
-        return f"HashBytes('MD5', {s})"
+        return f"LOWER(CONVERT(VARCHAR(32), {self._hash_md5(s)}, 2))"
 
 
 @attrs.define(frozen=False, init=False, kw_only=True)
@@ -174,12 +270,11 @@ class MsSQL(ThreadedDatabase):
     def __init__(self, host, port, user, password, *, database, thread_count, **kw) -> None:
         super().__init__(thread_count=thread_count)
 
-        args = dict(server=host, port=port, database=database, user=user, password=password, **kw)
+        # ODBC takes the port as part of the server name
+        server = f"{host},{port}" if port else host
+        args = dict(server=server, database=database, user=user, password=password, **kw)
         self._args = {k: v for k, v in args.items() if v is not None}
         self._args["driver"] = "{ODBC Driver 18 for SQL Server}"
-
-        # TODO temp dev debug
-        self._args["TrustServerCertificate"] = "yes"
 
         try:
             self.default_database = self._args["database"]
@@ -200,14 +295,15 @@ class MsSQL(ThreadedDatabase):
     def select_table_schema(self, path: DbPath) -> str:
         """Provide SQL for selecting the table schema as (name, type, date_prec, num_prec)"""
         database, schema, name = self._normalize_table_path(path)
-        info_schema_path = ["information_schema", "columns"]
+        # In uppercase, because a database with a case-sensitive collation is strict about these names
+        info_schema_path = ["INFORMATION_SCHEMA", "COLUMNS"]
         if database:
             info_schema_path.insert(0, self.dialect.quote(database))
 
         return (
-            "SELECT column_name, data_type, datetime_precision, numeric_precision, numeric_scale, collation_name "
+            "SELECT COLUMN_NAME, DATA_TYPE, DATETIME_PRECISION, NUMERIC_PRECISION, NUMERIC_SCALE, COLLATION_NAME "
             f"FROM {'.'.join(info_schema_path)} "
-            f"WHERE table_name = '{name}' AND table_schema = '{schema}'"
+            f"WHERE TABLE_NAME = '{name}' AND TABLE_SCHEMA = '{schema}'"
         )
 
     def _normalize_table_path(self, path: DbPath) -> DbPath:

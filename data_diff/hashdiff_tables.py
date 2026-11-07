@@ -7,7 +7,16 @@ from typing import Any, Collection, Dict, Iterator, List, Sequence, Set, Tuple
 import attrs
 from typing_extensions import Literal
 
-from data_diff.abcs.database_types import ColType_UUID, NumericType, PrecisionType, StringType, Boolean, JSON
+from data_diff.abcs.database_types import (
+    ColType_UUID,
+    Native_UUID,
+    NumericType,
+    PrecisionType,
+    String_UUID,
+    StringType,
+    Boolean,
+    JSON,
+)
 from data_diff.info_tree import InfoTree
 from data_diff.utils import safezip, diffs_are_equiv_jsons
 from data_diff.thread_utils import ThreadedYielder
@@ -156,6 +165,13 @@ class HashDiffer(TableDiffer):
                     table1._schema[c1] = attrs.evolve(col1, precision=lowest.precision)
                 if lowest.precision != col2.precision:
                     table2._schema[c2] = attrs.evolve(col2, precision=lowest.precision)
+
+            # Native UUIDs have no case, so a string UUID compared with one shouldn't either.
+            # This matters for text copied from SQL Server, which renders UUIDs in uppercase.
+            elif isinstance(col1, Native_UUID) and isinstance(col2, String_UUID):
+                table2._schema[c2] = attrs.evolve(col2, ignore_case=True)
+            elif isinstance(col1, String_UUID) and isinstance(col2, Native_UUID):
+                table1._schema[c1] = attrs.evolve(col1, ignore_case=True)
 
         for t in [table1, table2]:
             for c in t.relevant_columns:

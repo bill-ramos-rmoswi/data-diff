@@ -360,6 +360,13 @@ DATABASE_TYPES = {
             "BIT",
         ],
     },
+    db.Db2: {
+        "int": ["INTEGER", "BIGINT"],
+        "datetime": ["TIMESTAMP(6)", "TIMESTAMP(3)", "TIMESTAMP(0)"],
+        "float": ["DECIMAL(6, 2)", "DOUBLE", "REAL"],
+        "uuid": ["VARCHAR(100)", "CHAR(100)"],
+        "boolean": ["BOOLEAN"],
+    },
 }
 
 
@@ -631,6 +638,10 @@ def _insert_to_table(conn, table_path, values, coltype):
             )
             for i, sample in values
         ]
+    elif isinstance(conn, db.Db2) and coltype.startswith("DECIMAL("):
+        # Db2 truncates on insert, and the other databases round
+        scale = int(coltype[:-1].split(",")[1])
+        values = [(i, round(sample, scale)) for i, sample in values]
     # mssql represents with int
     elif isinstance(conn, db.MsSQL) and coltype in ("BIT"):
         values = [(i, int(sample)) for i, sample in values]

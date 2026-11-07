@@ -13,6 +13,7 @@ from data_diff.abcs.database_types import DbPath, DbKey, DbTime, IKey
 from data_diff.schema import RawColumnInfo, Schema, create_schema
 from data_diff.queries.extras import Checksum
 from data_diff.queries.api import Count, SKIP, table, this, Expr, min_, max_, Code
+from data_diff.queries.ast_classes import BinBoolOp
 from data_diff.queries.extras import ApplyFuncAndNormalizeAsString, NormalizeAsString
 
 logger = logging.getLogger("table_segment")
@@ -155,13 +156,17 @@ class TableSegment:
     def get_schema(self) -> Dict[str, RawColumnInfo]:
         return self.database.query_table_schema(self.table_path)
 
+    def _key_range_expr(self, key_column: str) -> Expr:
+        coltype = self._schema[key_column] if self._schema else None
+        return self.database.dialect.key_range_expr(this[key_column], coltype)
+
     def _make_key_range(self):
         if self.min_key is not None:
             for mn, k in safezip(self.min_key, self.key_columns):
-                yield mn <= this[k]
+                yield BinBoolOp(">=", [self._key_range_expr(k), mn])
         if self.max_key is not None:
             for k, mx in safezip(self.key_columns, self.max_key):
-                yield this[k] < mx
+                yield BinBoolOp("<", [self._key_range_expr(k), mx])
 
     def _make_update_range(self):
         if self.min_update is not None:
@@ -199,7 +204,13 @@ class TableSegment:
     def segment_by_checkpoints(self, checkpoints: List[List[DbKey]]) -> List["TableSegment"]:
         "Split the current TableSegment to a bunch of smaller ones, separated by the given checkpoints"
 
-        return [self.new_key_bounds(min_key=s, max_key=e) for s, e in create_mesh_from_points(*checkpoints)]
+        # Checkpoints come from one of the two tables, so convert them to this table's key types.
+        # Otherwise the casing of UUIDs leaks across, and selects no rows where string order is binary.
+        key_types = [self._schema[k] for k in self.key_columns] if self._schema else None
+        return [
+            self.new_key_bounds(min_key=s, max_key=e, key_types=key_types)
+            for s, e in create_mesh_from_points(*checkpoints)
+        ]
 
     def new(self, **kwargs) -> Self:
         """Creates a copy of the instance using 'replace()'"""

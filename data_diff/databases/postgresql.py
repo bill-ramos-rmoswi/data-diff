@@ -126,7 +126,7 @@ class PostgresqlDialect(BaseDialect):
 
         if isinstance(coltype, Time) or is_time:
             seconds = f"EXTRACT( epoch from {value})"
-            rounded = f"ROUND({seconds},  {coltype.precision})"
+            rounded = f"{'ROUND' if coltype.rounds else 'TRUNC'}({seconds},  {coltype.precision})"
             time_value = f"CAST('00:00:00' as time) + make_interval(0, 0, 0, 0, 0, 0, {rounded})"  # 6th arg = seconds
             converted = f"to_char({time_value}, 'hh24:mi:ss.ff6')"
             return converted

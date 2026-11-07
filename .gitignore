@@ -152,3 +152,7 @@ benchmark_*.png
 .history
 
 docker-compose-local.yml
+
+# Generated performance test data
+dev/perf/data/*
+!dev/perf/data/.gitkeep

@@ -1,35 +1,38 @@
-version: "3.8"
-
 services:
     postgres:
       container_name: dd-postgresql
-      image: postgres:14.1-alpine
+      image: postgres:18.6
       # work_mem: less tmp files
       # maintenance_work_mem: improve table-level op perf
       # max_wal_size: allow more time before merging to heap
       command: >
-        -c work_mem=1GB
+        -c shared_buffers=1GB
+        -c work_mem=256MB
         -c maintenance_work_mem=1GB
         -c max_wal_size=8GB
-      restart: always
+      cpus: 4
+      mem_limit: ${POSTGRES_MEM:-4g}
       volumes:
-        - postgresql-data:/var/lib/postgresql/data:delegated
+        # Postgres 18+ images keep data in a versioned subdirectory of this path
+        - postgresql-data:/var/lib/postgresql
       ports:
         - '5432:5432'
-      expose:
-        - '5432'
       env_file:
         - dev/dev.env
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U postgres"]
+        interval: 5s
+        timeout: 5s
+        retries: 24
       tty: true
       networks:
         - local
 
     mysql:
       container_name: dd-mysql
-      image: mysql:oracle
+      image: mysql:8.4.13
       # fsync less aggressively for insertion perf for test setup
       command: >
-        --default-authentication-plugin=mysql_native_password
         --binlog-cache-size=16M
         --key_buffer_size=0
         --max_connections=1000
@@ -37,26 +40,108 @@ services:
         --innodb_flush_log_at_timeout=10
         --innodb_log_compressed_pages=OFF
         --sync_binlog=0
-      restart: always
+      cpus: 2
+      mem_limit: ${MYSQL_MEM:-2g}
       volumes:
-        - mysql-data:/var/lib/mysql:delegated
+        - mysql-data:/var/lib/mysql
       user: mysql
       ports:
         - '3306:3306'
-      expose:
-        - '3306'
       env_file:
         - dev/dev.env
+      healthcheck:
+        test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pRootPassword1 --silent"]
+        interval: 5s
+        timeout: 5s
+        retries: 24
       tty: true
       networks:
         - local
 
+    mssql:
+      container_name: dd-mssql
+      image: mcr.microsoft.com/mssql/server:2025-CU9-GDR1-ubuntu-24.04
+      cpus: 4
+      mem_limit: ${MSSQL_MEM:-6g}
+      environment:
+        # Accepts the SQL Server EULA for this development instance.
+        ACCEPT_EULA: "Y"
+        MSSQL_PID: Developer
+      volumes:
+        - mssql-data:/var/opt/mssql
+        # RESTORE reads files on the server. See dev/perf/seed.py
+        - ./dev/perf/data:/perf-data:ro
+      ports:
+        # 14330 on the host, so this doesn't collide with a local SQL Server on 1433
+        - '14330:1433'
+      env_file:
+        - dev/dev.env
+      healthcheck:
+        # Also creates the test database. `docker compose up --wait` treats a
+        # finished one-shot init service as a failure, so it can't live in one.
+        test:
+          - CMD-SHELL
+          - >-
+            /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost -U sa -P "$$MSSQL_SA_PASSWORD"
+            -Q "IF DB_ID('testdb') IS NULL CREATE DATABASE testdb"
+        interval: 5s
+        timeout: 10s
+        retries: 36
+        start_period: 20s
+      tty: true
+      networks:
+        - local
+
+    db2:
+      container_name: dd-db2
+      image: icr.io/db2_community/db2:12.1.5.0
+      # Required by the Db2 image
+      privileged: true
+      # Community Edition is licensed for up to 4 cores and 16 GB
+      cpus: 4
+      mem_limit: ${DB2_MEM:-10g}
+      environment:
+        # Accepts the Db2 Community Edition license for this development instance.
+        LICENSE: accept
+        DB2INSTANCE: db2inst1
+        DBNAME: testdb
+        BLU: "false"
+        ENABLE_ORACLE_COMPATIBILITY: "false"
+        UPDATEAVAIL: "NO"
+        TO_CREATE_SAMPLEDB: "false"
+        REPODB: "false"
+        IS_OSXFS: "false"
+        PERSISTENT_HOME: "true"
+        HADR_ENABLED: "false"
+      volumes:
+        - db2-data:/database
+        - ./dev/db2/init.sh:/var/custom/init.sh:ro
+        # LOAD reads files on the server. See dev/perf/seed.py
+        - ./dev/perf/data:/perf-data:ro
+      ports:
+        - '50000:50000'
+      env_file:
+        - dev/dev.env
+      healthcheck:
+        # The log setting proves dev/db2/init.sh ran, which restarts the database.
+        test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to testdb && db2 get db cfg for testdb' | grep -q 'LOGFILSIZ) = 16384'"]
+        interval: 15s
+        timeout: 30s
+        retries: 40
+        start_period: 120s
+      tty: true
+      networks:
+        - local
+
+    # The databases below are stale and aren't part of the default stack.
+    # Start them with `docker compose --profile legacy up -d`.
+
     clickhouse:
       container_name: dd-clickhouse
       image: clickhouse/clickhouse-server:21.12.3.32
-      restart: always
+      profiles: [legacy]
       volumes:
-          - clickhouse-data:/var/lib/clickhouse:delegated
+          - clickhouse-data:/var/lib/clickhouse
       ulimits:
         nproc: 65535
         nofile:
@@ -65,9 +150,6 @@ services:
       ports:
         - '8123:8123'
         - '9000:9000'
-      expose:
-        - '8123'
-        - '9000'
       env_file:
         - dev/dev.env
       tty: true
@@ -77,6 +159,7 @@ services:
     # prestodb.dbapi.connect(host="127.0.0.1", user="presto").cursor().execute('SELECT * FROM system.runtime.nodes')
     presto:
         container_name: dd-presto
+        profiles: [legacy]
         build:
             context: ./dev
             dockerfile: ./Dockerfile.prestosql.340
@@ -91,6 +174,7 @@ services:
     trino:
         container_name: dd-trino
         image: 'trinodb/trino:389'
+        profiles: [legacy]
         hostname: trino
         ports:
             - '8081:8080'
@@ -102,26 +186,23 @@ services:
     vertica:
       container_name: dd-vertica
       image: vertica/vertica-ce:12.0.0-0
-      restart: always
+      profiles: [legacy]
       volumes:
-          - vertica-data:/data:delegated
+          - vertica-data:/data
       ports:
         - '5433:5433'
         - '5444:5444'
-      expose:
-        - '5433'
-        - '5444'
       env_file:
         - dev/dev.env
       tty: true
       networks:
       - local
 
-
-
 volumes:
   postgresql-data:
   mysql-data:
+  mssql-data:
+  db2-data:
   clickhouse-data:
   vertica-data:
 
