@@ -4,7 +4,11 @@ Written for: a fresh Claude Code session in the devcontainer, opened from `~/rep
 
 The test server is now a known quantity. The facts under TEST SERVER were measured on the image built from [sap-ase-16-trial-docker-image](https://github.com/bill-ramos-rmoswi/sap-ase-16-trial-docker-image) (see its README), so the session can rely on them. ASE SQL behavior (hashing, rounding, empty strings) still comes from general knowledge, and the prompt tells the session to prove it on the server.
 
-Before pasting the prompt, make sure the image is in GHCR. From WSL, `docker manifest inspect ghcr.io/bill-ramos-rmoswi/sap-ase:16.1-SP00-PL02` should succeed. If it doesn't, run `./scripts/build.sh --push` in the image repo first.
+Before pasting the prompt, do these once. The session isn't allowed to change package settings, so it can't do them itself:
+
+1. **Image in GHCR.** From a WSL terminal, `docker manifest inspect ghcr.io/bill-ramos-rmoswi/sap-ase:16.1-SP00-PL02` should succeed. If it reports an auth error, log in to `ghcr.io` there (`echo "$GHCR_TOKEN" | docker login ghcr.io -u bill-ramos-rmoswi --password-stdin`, with a token that has `read:packages`). If the tag is missing, run `./scripts/build.sh --push` in the image repo.
+2. **CI access.** On GitHub, open the `sap-ase` package → **Package settings → Manage Actions access → Add Repository**, and add `bill-ramos-rmoswi/data-diff` with **Read** or **Write** (done; it has Write). Without it, `GITHUB_TOKEN` can't pull the image and the session hits STOP CONDITION 4.
+3. **License date.** The pushed image's grace period ends on Sat 06 Feb 2027. If you rebuild with `--no-cache`, update that date under TEST SERVER.
 
 ```text
 Add SAP Sybase ASE as both source and target in data-diff, in
@@ -22,7 +26,8 @@ MY ANSWERS
   the ASE job visibly.
 - Driver: choose after the Phase 1 spike. The image ships no ODBC or Python driver,
   and the SAP drivers can't be redistributed to CI, so start with pyodbc + FreeTDS
-  (tdsodbc), installed from apt in the devcontainer and in CI.
+  (tdsodbc), installed from apt in the devcontainer and in CI. FreeTDS must use
+  TDS version 5.0 for ASE.
 - First tables and column types to compare: the perf tables fact_2x and fact_13x
   (INT keys, DATE, NUMERIC(19,4), INT), then the standard type suites.
 
@@ -106,8 +111,8 @@ PHASE 0: PLAN AND SERVER SETUP
 - Check that the baseline suite passes on master before changing anything.
 - Add the ase service to docker-compose.yml under profiles: [ase] (the image
   README has the snippet), with container_name dd-ase, mem_limit
-  ${ASE_MEM:-2g}, the named volume ase-data:/opt/sap/data, and the perf data
-  mount ./dev/perf/data:/perf-data:ro. Add it to runServices in
+  ${ASE_MEM:-2g} and the named volume ase-data:/opt/sap/data. No perf data
+  mount: the seed loads over TDS (Phase 5). Add it to runServices in
   .devcontainer/devcontainer.json only if it doesn't break devcontainers for
   users without GHCR access; otherwise document
   `docker compose --profile ase up -d --wait ase` in CLAUDE.md.
@@ -230,8 +235,10 @@ PHASE 4: TESTS
 - CI: in .github/workflows/pr-validate.yml, add ASE to the integration job, or a
   sibling job, with permissions packages: read, a GHCR login using GITHUB_TOKEN,
   `docker compose --profile ase up -d --wait`, and a memory split that fits the
-  16 GB runner beside Db2 6g, SQL Server 3g and PostgreSQL 2g (ASE 2g, which
-  the image's settings already fit). CI needs no ase-data volume. Skip it for
+  16 GB runner. The integration job already runs Db2 6g, SQL Server 3g,
+  PostgreSQL 2g and MySQL 2g, so adding ASE 2g (which the image's settings fit)
+  makes 15g. Prefer a sibling job for the ASE pairs if that leaves too little
+  for the runner itself. CI needs no ase-data volume. Skip it for
   fork PRs with
   if: github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
