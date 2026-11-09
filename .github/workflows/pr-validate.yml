@@ -21,8 +21,8 @@ jobs:
     name: Check formatting
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install Poetry
@@ -41,8 +41,8 @@ jobs:
       matrix:
         python-version: ["3.9", "3.10", "3.11"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Start databases
@@ -68,8 +68,8 @@ jobs:
       MSSQL_MEM: 3g
       POSTGRES_MEM: 2g
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Start databases
