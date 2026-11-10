@@ -29,6 +29,18 @@ URIS = {
     "Db2": os.environ["DATADIFF_DB2_URI"],
 }
 PAIRS = [("PostgreSQL", "MsSQL"), ("PostgreSQL", "Db2"), ("MsSQL", "Db2")]
+# The perf tables are in their own ASE database, see dev/perf/seed.py
+if os.environ.get("DATADIFF_SYBASE_URI"):
+    sys.path.insert(0, os.path.dirname(__file__))
+    from seed import sybase_perf_uri
+
+    URIS["Sybase"] = sybase_perf_uri()
+    PAIRS += [(a, b) for other in ("PostgreSQL", "MsSQL", "Db2") for a, b in ((other, "Sybase"), ("Sybase", other))]
+if os.environ.get("PERF_PAIRS"):
+    # For example PERF_PAIRS=Sybase:PostgreSQL,PostgreSQL:Sybase
+    PAIRS = [tuple(pair.split(":")) for pair in os.environ["PERF_PAIRS"].split(",")]
+# Describes the ASE server for the results, such as "2g image defaults"
+SYBASE_CONFIG = os.environ.get("SYBASE_CONFIG", "")
 
 # One date, for a fifth of the products, in every ScaleKey. Spreads about 0.016% of rows across the table.
 PRODUCT_KEYS = ", ".join(str(key) for key in range(5, 610, 5))
@@ -50,7 +62,7 @@ def changed_keys(conn, table_sql: str) -> set:
 
 def save_rows(conn, table_sql: str):
     query = f"SELECT * FROM {changed_rows(conn, table_sql)}"
-    if conn.name == "MsSQL":
+    if conn.name in ("MsSQL", "Sybase"):
         conn.query(f"SELECT * INTO {SAVED_TABLE} FROM {changed_rows(conn, table_sql)}", None)
     elif conn.name == "Db2":
         conn.query(f"CREATE TABLE {SAVED_TABLE} AS ({query}) WITH DATA", None)
@@ -113,6 +125,8 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
             "changed_rows": len(keys) if scenario != "identical" else 0,
             "threads": THREADS,
         }
+        if "Sybase" in (source, target):
+            result["sybase_config"] = SYBASE_CONFIG
         with open(f"benchmark_{revision}.jsonl", "a", encoding="utf-8") as file:
             file.write(json.dumps(result) + "\n")
 

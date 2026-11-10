@@ -680,7 +680,7 @@ class Sybase(ThreadedDatabase):
         # characters, and for float, its binary precision.
         return (
             "SELECT c.name, t.name, "
-            "CASE t.name WHEN 'datetime' THEN 3 WHEN 'time' THEN 3 WHEN 'smalldatetime' THEN 0 "
+            "CASE t.name WHEN 'datetime' THEN 3 WHEN 'time' THEN 3 WHEN 'smalldatetime' THEN 0 WHEN 'date' THEN 0 "
             "WHEN 'bigdatetime' THEN 6 WHEN 'bigtime' THEN 6 END, "
             "CASE WHEN t.name IN ('float', 'real') THEN (CASE WHEN c.length = 4 THEN 24 ELSE 53 END) "
             "WHEN t.name IN ('univarchar', 'unichar') THEN c.length / @@unicharsize "
