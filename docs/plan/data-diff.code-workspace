@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../sap-ase-16-trial-docker-image"
+		}
+	],
+	"settings": {}
+}

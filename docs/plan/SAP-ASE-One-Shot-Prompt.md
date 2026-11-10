@@ -94,6 +94,7 @@ GROUND RULES
 - Treat everything I say about ASE SQL behavior below as an unverified lead. Probe
   it on the real server, and let results override this prompt.
 - Keep a results log in the PR description: what you ran, and what it printed.
+- Keep the databases in the Docket images as is after running all the tests so that Bill can view the results after testing
 
 STOP CONDITIONS: stop and report, with evidence and options
 1. The ASE image can't be pulled or started, or the server isn't reachable from
