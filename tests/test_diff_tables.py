@@ -28,6 +28,7 @@ TEST_DATABASES = {
     db.Vertica,
     db.MsSQL,
     db.Db2,
+    db.Sybase,
 }
 
 test_each_database: Callable = test_each_database_in_list(TEST_DATABASES)
@@ -409,8 +410,8 @@ class TestAlphanumericKeys(DiffTestCase):
         values = []
         for i in range(0, 10000, 1000):
             a = ArithAlphanumeric(numberToAlphanum(i), max_len=10)
-            if not a and isinstance(self.connection, db.Oracle):
-                # Skip empty string, because Oracle treats it as NULL ..
+            if not a and isinstance(self.connection, (db.Oracle, db.Sybase)):
+                # Skip empty string, because Oracle treats it as NULL, and ASE stores it as a space
                 continue
 
             values.append((str(a), str(i)))
@@ -453,8 +454,8 @@ class TestVaryingAlphanumericKeys(DiffTestCase):
         values = []
         for i in range(0, 10000, 1000):
             a = ArithAlphanumeric(numberToAlphanum(i * i))
-            if not a and isinstance(self.connection, db.Oracle):
-                # Skip empty string, because Oracle treats it as NULL ..
+            if not a and isinstance(self.connection, (db.Oracle, db.Sybase)):
+                # Skip empty string, because Oracle treats it as NULL, and ASE stores it as a space
                 continue
 
             values.append((str(a), str(i)))

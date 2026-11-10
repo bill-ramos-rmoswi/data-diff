@@ -16,3 +16,4 @@ from data_diff.databases.vertica import Vertica as Vertica
 from data_diff.databases.duckdb import DuckDB as DuckDB
 from data_diff.databases.mssql import MsSQL as MsSQL
 from data_diff.databases.db2 import Db2 as Db2
+from data_diff.databases.sybase import Sybase as Sybase

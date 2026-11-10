@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Upstream Datafold stopped developing open source data-diff in May 2024, so this fork (`bill-ramos-rmoswi/data-diff`) owns its CI and releases. Don't open PRs against `datafold/data-diff`; pass `--repo bill-ramos-rmoswi/data-diff` to `gh`.
 
-Goal: use the Python API to validate data between IBM Db2 12.1, SQL Server 2025 (latest CU) and PostgreSQL 18.6, deployed as a wheel attached to a GitHub Release.
+Goal: use the Python API to validate data between IBM Db2 12.1, SQL Server 2025 (latest CU), PostgreSQL 18.6 and SAP ASE 16.1, deployed as a wheel attached to a GitHub Release.
 
-Pinned targets are in `docker-compose.yml`: `db2:12.1.5.0`, `mssql/server:2025-CU9-GDR1-ubuntu-24.04` and `postgres:18.6`. MySQL stays in the stack because `test_api.py`, `test_sql.py` and `test_main.py` hardcode it.
+Pinned targets are in `docker-compose.yml`: `db2:12.1.5.0`, `mssql/server:2025-CU9-GDR1-ubuntu-24.04`, `postgres:18.6` and `ghcr.io/bill-ramos-rmoswi/sap-ase:16.1-SP00-PL02`. MySQL stays in the stack because `test_api.py`, `test_sql.py` and `test_main.py` hardcode it.
 
 ## Environment
 
@@ -18,11 +18,22 @@ The container has no Docker socket. Start, stop and reset databases from a WSL t
 
 ```shell
 docker compose up -d --wait postgres mysql mssql db2     # Db2 takes a minute or more when its volume is new
+docker compose --profile ase up -d --wait ase            # SAP ASE, from a private image (see below)
 docker compose --profile legacy up -d                    # stale databases: presto, trino, clickhouse, vertica
 docker compose down -v                                   # delete all database volumes
 ```
 
 From outside the compose network, SQL Server is on host port **14330**, because a local instance may hold 1433. Db2 needs `dev/db2/init.sh`, which raises the transaction log limits, and its healthcheck waits for that.
+
+### SAP ASE
+
+- **Private image.** `ghcr.io/bill-ramos-rmoswi/sap-ase:16.1-SP00-PL02` is built from the SAP trial by [sap-ase-16-trial-docker-image](https://github.com/bill-ramos-rmoswi/sap-ase-16-trial-docker-image), and must never be published. To pull it, run `docker login ghcr.io` once in WSL with a token that has `read:packages`. CI pulls it with `GITHUB_TOKEN`, because the package grants this repo access. Pull requests from forks can't, so they skip the ASE job, and `sybase-skipped` says so in the job summary.
+- **It isn't in `runServices`**, so a devcontainer without GHCR access still starts. The devcontainer sets `DATADIFF_SYBASE_URI` anyway. When ASE isn't running, `tests/common.py` fails at import and says to start it, or to unset the variable.
+- **License.** The SySAM grace period ends on **Sat 06 Feb 2027 20:46 UTC**, and ASE then shuts down. `sp_lmconfig` shows the date, and so does the error log at each start. A rebuild with `scripts/build.sh --no-cache` in the image repo renews it.
+- **Data** is in the named volume `ase-data` at `/opt/sap/data`, which holds every device, `master` included. Never bind-mount it, and put new devices there, or a recreated container won't know them. Server ASE, port 5000, `sa`/`Password1`, database `testdb`.
+- **Runtime setup** is `dev/ase/init.sql`, which `dev/ase/init.py` applies over TDS. `tests/common.py` runs it on every test run, because it's idempotent. It turns on `allow nulls by default` in `testdb`, raises the procedure cache to 120000 pages, and creates the read-only login `dd_reader`. The procedure cache setting lives in the container's `ASE.cfg`, not the volume, so a recreated container needs init again.
+- **Memory.** `mem_limit` is `${ASE_MEM:-2g}`, which the image's settings fit. For the 4 GB benchmark, recreate it with `ASE_MEM=4g` and raise `max memory` and the data cache at runtime (both dynamic).
+- From the devcontainer, use `tsql -H ase -p 5000 -U sa -P Password1` with `TDSVER=5.0`, or `freebcp`. `docker logs dd-ase` and `docker exec` work only from WSL.
 
 ## Commands
 
@@ -55,7 +66,7 @@ Override connection strings in `tests/local_settings.py` (git-ignored), or use t
 | `0` | PostgreSQL against itself |
 | `full` | every configured database against every other |
 
-Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/test_cross_db_fact.py`.
+Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/test_cross_db_fact.py`. ASE against each database is in `tests/test_cross_db_types.py`, `tests/test_cross_db_fact.py` and `tests/test_sybase.py`, and CI's `sybase` job runs `-k Sybase -k sybase` with `TEST_ACROSS_ALL_DBS=full`.
 
 `N_SAMPLES` sets the row count per type test (default 50), and `N_THREADS` sets the thread count (default 1).
 
@@ -68,7 +79,9 @@ poetry run python dev/perf/seed.py                       # about 1 minute
 poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, writes benchmark_<revision>.jsonl
 ```
 
-`run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB.
+`run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB, and the ASE trial runs in a container.
+
+With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sybase` loads it from the CSVs a previous run exported. ASE has no server-side load, so `freebcp` sends the rows over TDS into `perfdb`, which has its own devices `perfdata` (2,500 MB) and `perflog` (1,000 MB) in `/opt/sap/data`. Measured `sp_spaceused`: `fact_2x` 61 MB, `fact_13x` 399 MB. The primary key is added after the load, and `seed.py` checks counts, sums and the data-diff checksum against PostgreSQL. `run_perf.py` adds ASE in both directions against the other three. `PERF_PAIRS=Sybase:PostgreSQL,...` runs only some pairs, and `SYBASE_CONFIG` labels the results.
 
 ## Database behavior that's easy to get wrong
 
@@ -83,6 +96,22 @@ poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, wri
 - **Close API connections.** PostgreSQL connections from `connect_to_table` stay in a transaction, which blocks `DROP TABLE`. Call `segment.database.close()` when done.
 - **`NVARCHAR(MAX)` is expensive on SQL Server.** It made checksums about 3 times slower, so only text columns use it. `FORMAT()` is slower still, and adds thousands separators.
 - **Db2 table and column names are case-sensitive here.** data-diff quotes them, and Db2 stores unquoted names in uppercase, so pass `FACT`, not `fact`, for a table created without quotes.
+
+### SAP ASE behavior
+
+- **The server is cp850, and FreeTDS logs in with an empty character set**, so the connection is always cp850. SQL text must only contain cp850 characters, and the dialect writes others as `U&'\XXXX'`. `set char_convert utf8` changes the server but not FreeTDS, which then corrupts the statement.
+- **No server-side UTF-8.** cp850 text goes through `univarchar`, where `str_replace` swaps each non-ASCII character for Private Use Area characters U+E000+b, one per UTF-8 byte. Then every 00 and E0 byte is removed from the UTF-16LE bytes. Swapping bytes directly can't work, because the 128 mappings form a cycle. Unicode text is converted one UTF-16 code unit at a time, which makes about 1.6 KB of SQL per character, so it has a length limit.
+- **Converting to `univarchar` stops at the first NUL**, silently. NUL is escaped as 01 02 (and 01 as 01 03) first.
+- **Expressions stop at 16,384 bytes without an error**: `+`, `replicate` and `convert` all truncate, and `univarchar` stops at 8,192 units. Every path that could exceed it checks first. `convert(int, 'message ' + <row value>)` raises the error, and it must depend on a row, or ASE may raise it while compiling.
+- **`convert(varchar, univarchar)` turns other characters into `?`**, silently, so equal-looking values can come from different text. Never convert Unicode text to cp850 without checking it converts back.
+- **ASE cancels unread statements in a batch.** pyodbc returns after the first result, so `_query_cursor` reads every result set, which is also how an error in a later statement surfaces. Without that, 228 of 1,001 inserts ran.
+- **`''` is one space, and `varchar` drops trailing spaces.** Never write `''` in generated SQL. `text` keeps trailing spaces, but converting it drops them, so they're added back from `datalength`.
+- **Columns are NOT NULL unless they say otherwise.** The dialect writes `NULL` on every non-key column, except `bit`, which can't be NULL.
+- **No FULL OUTER JOIN, LIMIT, OFFSET, DROP TABLE IF EXISTS or multi-row VALUES.** ORDER BY isn't allowed in a derived table, and derived-table columns must have names. Brackets quote names, but not `#temp` names. `IF ... CREATE TABLE` compiles the CREATE even when the table exists, so it runs through `EXEC()`.
+- **`datetime` and `time` store 1/300 s ticks and show them truncated** (tick 299 is .996667, shown as .996). The dialect recovers the tick from the milliseconds and uses its exact value. Casts of numbers truncate, literals with too many decimals fail, and `money` shows 2 decimals.
+- **FreeTDS returns `unsigned int` as signed** and `unitext` as bytes. Key bounds and downloaded rows are fetched as server-side strings, so neither reaches a comparison.
+- **The procedure cache fills up** when parallel diffs compile Unicode checksums. `_query_cursor` retries error 701 on a new cursor.
+- **A failed fetch doesn't keep locks**, unlike Db2, but the driver still cancels and closes the cursor.
 
 ## Architecture
 

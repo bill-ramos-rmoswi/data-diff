@@ -32,6 +32,7 @@ TEST_DATABASES = {
     dbs.Vertica,
     dbs.MsSQL,
     dbs.Db2,
+    dbs.Sybase,
 }
 
 test_each_database: Callable = test_each_database_in_list(TEST_DATABASES)
@@ -72,7 +73,7 @@ class TestQueries(unittest.TestCase):
         assert isinstance(res, datetime), (res, type(res))
 
     def test_correct_timezone(self):
-        if self.db_cls in [dbs.MsSQL, dbs.Db2]:
+        if self.db_cls in [dbs.MsSQL, dbs.Db2, dbs.Sybase]:
             self.skipTest("No support for session tz.")
         name = "tbl_" + random_table_suffix()
 

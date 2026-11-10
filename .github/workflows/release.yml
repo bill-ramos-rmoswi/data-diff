@@ -10,6 +10,10 @@ permissions:
 jobs:
   validate:
     uses: ./.github/workflows/pr-validate.yml
+    # The SAP ASE job pulls a private image, and a called workflow can't have more permissions than this
+    permissions:
+      contents: read
+      packages: read
 
   release:
     name: Publish wheel to a GitHub Release

@@ -30,9 +30,18 @@ TEST_DATABASES = {
     db.Vertica,
     db.MsSQL,
     db.Db2,
+    db.Sybase,
 }
 
 test_each_database = test_each_database_in_list(TEST_DATABASES)
+
+
+def _materialized_rows(connection, t) -> list:
+    rows = connection.query(t.select(), List[tuple])
+    if isinstance(connection, db.Sybase):
+        # Materialized text is unitext, which FreeTDS returns as UTF-16LE bytes
+        rows = [tuple(v.decode("utf-16-le") if isinstance(v, (bytes, bytearray)) else v for v in r) for r in rows]
+    return rows
 
 
 @test_each_database_in_list({db.Snowflake, db.BigQuery, db.DuckDB})
@@ -124,7 +133,7 @@ class TestJoindiff(DiffTestCase):
         self.assertEqual(expected, diff)
 
         t = TablePath(materialize_path)
-        rows = self.connection.query(t.select(), List[tuple])
+        rows = _materialized_rows(self.connection, t)
         # is_xa, is_xb, is_diff1, is_diff2, row1, row2
         # assert rows == [(1, 0, 1, 1) + expected_row + (None, None)], rows
         assert rows == [(1, 0, 1, 1) + (expected_row[0], None, expected_row[1], None)], rows
@@ -134,7 +143,7 @@ class TestJoindiff(DiffTestCase):
         mdiffer = attrs.evolve(mdiffer, materialize_all_rows=True)
         diff = list(mdiffer.diff_tables(self.table, self.table2))
         self.assertEqual(expected, diff)
-        rows = self.connection.query(t.select(), List[tuple])
+        rows = _materialized_rows(self.connection, t)
         assert len(rows) == 2, len(rows)
         self.connection.query(t.drop())
 
