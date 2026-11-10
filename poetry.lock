@@ -2295,10 +2295,11 @@ preql = ["preql"]
 presto = ["presto-python-client"]
 redshift = ["psycopg2"]
 snowflake = ["cryptography", "snowflake-connector-python"]
+sybase = ["pyodbc"]
 trino = ["trino"]
 vertica = ["vertica-python"]
 
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.9,<4.0"
-content-hash = "2acaef109f95d43cb845774ff35193ff923a569187ff10ff60299864af683f35"
+content-hash = "372c7d091dd4f2b93a08088262137942e3ac585d2c3a6f13d19bab65c1d743f5"

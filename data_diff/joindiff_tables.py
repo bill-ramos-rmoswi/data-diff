@@ -9,7 +9,7 @@ from itertools import chain
 
 import attrs
 
-from data_diff.databases import Database, Db2, MsSQL, MySQL, BigQuery, Presto, Oracle, Snowflake, DuckDB
+from data_diff.databases import Database, Db2, MsSQL, MySQL, BigQuery, Presto, Oracle, Snowflake, DuckDB, Sybase
 from data_diff.abcs.database_types import NumericType, DbPath
 from data_diff.databases.base import Compiler
 from data_diff.queries.api import (
@@ -66,7 +66,7 @@ def create_temp_table(c: Compiler, path: TablePath, expr: Expr) -> str:
         return f"create global temporary table {c.dialect.compile(c, path)} as {c.dialect.compile(c, expr)}"
     elif isinstance(db, Db2):
         return f"create table {c.dialect.compile(c, path)} as ({c.dialect.compile(c, expr)}) with data"
-    elif isinstance(db, MsSQL):
+    elif isinstance(db, (MsSQL, Sybase)):
         return f"select * into {c.dialect.compile(c, path)} from ({c.dialect.compile(c, expr)}) as source"
     else:
         return f"create temporary table {c.dialect.compile(c, path)} as {c.dialect.compile(c, expr)}"
@@ -82,7 +82,7 @@ def _outerjoin(db: Database, a: ITable, b: ITable, keys1: List[str], keys2: List
     is_exclusive_a = and_(b[k] == None for k in keys2)
     is_exclusive_b = and_(a[k] == None for k in keys1)
 
-    if isinstance(db, MsSQL):
+    if isinstance(db, (MsSQL, Sybase)):
         # There is no "IS NULL" or "ISNULL()" as expressions, only as conditions.
         is_exclusive_a = when(is_exclusive_a).then(1).else_(0)
         is_exclusive_b = when(is_exclusive_b).then(1).else_(0)
@@ -91,10 +91,11 @@ def _outerjoin(db: Database, a: ITable, b: ITable, keys1: List[str], keys2: List
         is_exclusive_a = bool_to_int(is_exclusive_a)
         is_exclusive_b = bool_to_int(is_exclusive_b)
 
-    if isinstance(db, MySQL):
-        # No outer join
-        l = leftjoin(a, b).on(*on).select(is_exclusive_a=is_exclusive_a, is_exclusive_b=False, **select_fields)
-        r = rightjoin(a, b).on(*on).select(is_exclusive_a=False, is_exclusive_b=is_exclusive_b, **select_fields)
+    if isinstance(db, (MySQL, Sybase)):
+        # No full outer join. ASE has no boolean values either.
+        false = 0 if isinstance(db, Sybase) else False
+        l = leftjoin(a, b).on(*on).select(is_exclusive_a=is_exclusive_a, is_exclusive_b=false, **select_fields)
+        r = rightjoin(a, b).on(*on).select(is_exclusive_a=false, is_exclusive_b=is_exclusive_b, **select_fields)
         return l.union(r)
 
     return outerjoin(a, b).on(*on).select(is_exclusive_a=is_exclusive_a, is_exclusive_b=is_exclusive_b, **select_fields)
@@ -368,7 +369,7 @@ class JoinDiffer(TableDiffer):
         table1: Optional[TableSegment] = None,
         table2: Optional[TableSegment] = None,
     ):
-        if isinstance(db, (Oracle, MsSQL)):
+        if isinstance(db, (Oracle, MsSQL, Sybase)):
             exclusive_rows_query = diff_rows.where((this.is_exclusive_a == 1) | (this.is_exclusive_b == 1))
         else:
             exclusive_rows_query = diff_rows.where(this.is_exclusive_a | this.is_exclusive_b)
@@ -383,8 +384,8 @@ class JoinDiffer(TableDiffer):
         logger.info("Counting and sampling exclusive rows")
 
         c = Compiler(db)
-        # A # name makes it a real temporary table on SQL Server, which needs no extra permissions
-        name = c.new_unique_table_name("#temp_table" if isinstance(db, MsSQL) else "temp_table")
+        # A # name makes it a real temporary table on SQL Server and ASE, which needs no extra permissions
+        name = c.new_unique_table_name("#temp_table" if isinstance(db, (MsSQL, Sybase)) else "temp_table")
         exclusive_rows = table(name, schema=exclusive_rows_query.source_table.schema)
 
         def sample_exclusive_rows(expr):

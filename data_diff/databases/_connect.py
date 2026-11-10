@@ -25,6 +25,7 @@ from data_diff.databases.vertica import Vertica
 from data_diff.databases.duckdb import DuckDB
 from data_diff.databases.mssql import MsSQL
 from data_diff.databases.db2 import Db2
+from data_diff.databases.sybase import Sybase
 
 
 @attrs.frozen
@@ -92,6 +93,7 @@ DATABASE_BY_SCHEME = {
     "vertica": Vertica,
     "mssql": MsSQL,
     "db2": Db2,
+    "sybase": Sybase,
 }
 
 
@@ -138,6 +140,7 @@ class Connect:
         - duckdb
         - mssql
         - db2
+        - sybase
         """
 
         dsn = dsnparse.parse(db_uri)
@@ -260,6 +263,7 @@ class Connect:
         - vertica
         - mssql
         - db2
+        - sybase
 
         Example:
             >>> connect("mysql://localhost/db")

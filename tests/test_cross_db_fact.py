@@ -1,4 +1,4 @@
-"""Diffs a fact table across PostgreSQL, SQL Server and Db2, through the public Python API.
+"""Diffs a fact table across PostgreSQL, SQL Server, Db2 and Sybase ASE, through the public Python API.
 
 The table has the shape of AdventureWorksDW's FactProductInventory: a compound key, a date and a
 money column. Text adds non-ASCII values, and costs of 1,000 or more cover thousands separators.
@@ -17,6 +17,8 @@ COST_AND_NOTE_TYPES = {
     db.PostgreSQL: ("NUMERIC(19, 4)", "VARCHAR(50)"),
     db.MsSQL: ("MONEY", "NVARCHAR(50)"),
     db.Db2: ("DECIMAL(19, 4)", "VARCHAR(200)"),
+    # The server's character set is cp850, so CJK and emoji need univarchar
+    db.Sybase: ("NUMERIC(19, 4)", "UNIVARCHAR(50)"),
 }
 
 KEY_COLUMNS = ("product_key", "date_key")
@@ -43,6 +45,9 @@ def _literal(conn, value) -> str:
         return "NULL"
     if not isinstance(value, str):
         return str(value)
+    if isinstance(conn, db.Sybase):
+        # SQL text travels in cp850, so other characters need escapes
+        return conn.dialect._constant_value(value)
     return f"N'{value}'" if isinstance(conn, db.MsSQL) else f"'{value}'"
 
 

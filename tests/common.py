@@ -40,6 +40,7 @@ TEST_VERTICA_CONN_STRING: str = os.environ.get("DATADIFF_VERTICA_URI")
 TEST_DUCKDB_CONN_STRING: str = "duckdb://main:@:memory:"
 TEST_MSSQL_CONN_STRING: str = os.environ.get("DATADIFF_MSSQL_URI")
 TEST_DB2_CONN_STRING: str = os.environ.get("DATADIFF_DB2_URI")
+TEST_SYBASE_CONN_STRING: str = os.environ.get("DATADIFF_SYBASE_URI") or None
 
 
 DEFAULT_N_SAMPLES = 50
@@ -87,6 +88,7 @@ CONN_STRINGS = {
     db.DuckDB: TEST_DUCKDB_CONN_STRING,
     db.MsSQL: TEST_MSSQL_CONN_STRING,
     db.Db2: TEST_DB2_CONN_STRING,
+    db.Sybase: TEST_SYBASE_CONN_STRING,
 }
 
 
@@ -109,6 +111,28 @@ def _print_used_dbs():
 
 _print_used_dbs()
 CONN_STRINGS = {k: v for k, v in CONN_STRINGS.items() if v is not None}
+
+
+def _init_sybase():
+    """Applies dev/ase/init.sql, which the tests need. It's idempotent, so every run applies it."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "dev" / "ase" / "init.py"
+    spec = importlib.util.spec_from_file_location("ase_init", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.apply(CONN_STRINGS[db.Sybase])
+    except db.ConnectError as e:
+        raise RuntimeError(
+            f"Can't connect to SAP ASE at DATADIFF_SYBASE_URI={CONN_STRINGS[db.Sybase]}. Start it from WSL with "
+            "`docker compose --profile ase up -d --wait ase`, or unset DATADIFF_SYBASE_URI to skip ASE."
+        ) from e
+
+
+if db.Sybase in CONN_STRINGS:
+    _init_sybase()
 
 
 def random_table_suffix() -> str:

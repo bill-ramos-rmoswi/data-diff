@@ -133,6 +133,30 @@ services:
       networks:
         - local
 
+    # SAP ASE 16.1 trial, from a private image. Start it with
+    # `docker compose --profile ase up -d --wait ase` after `docker login ghcr.io`.
+    ase:
+      container_name: dd-ase
+      image: ghcr.io/bill-ramos-rmoswi/sap-ase:16.1-SP00-PL02
+      profiles: [ase]
+      cpus: 4
+      mem_limit: ${ASE_MEM:-2g}
+      volumes:
+        # Holds every device, master included, so it must be a named volume.
+        # A bind mount would hide master. New devices must go here too.
+        - ase-data:/opt/sap/data
+      ports:
+        - '5000:5000'
+      healthcheck:
+        test: ["CMD", "/opt/sap/healthcheck.sh"]
+        interval: 5s
+        timeout: 10s
+        retries: 24
+        start_period: 10s
+      tty: true
+      networks:
+        - local
+
     # The databases below are stale and aren't part of the default stack.
     # Start them with `docker compose --profile legacy up -d`.
 
@@ -203,6 +227,7 @@ volumes:
   mysql-data:
   mssql-data:
   db2-data:
+  ase-data:
   clickhouse-data:
   vertica-data:
 

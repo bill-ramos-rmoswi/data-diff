@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 import logging
 from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal as PyDecimal
 from itertools import islice, repeat, chain
 from typing import Iterator
 
@@ -367,6 +368,16 @@ DATABASE_TYPES = {
         "uuid": ["VARCHAR(100)", "CHAR(100)"],
         "boolean": ["BOOLEAN"],
     },
+    db.Sybase: {
+        "int": ["int", "bigint", "numeric(18,0)"],
+        # datetime stores 1/300 second steps, which can't hold these samples. See tests/test_sybase.py
+        "datetime": ["bigdatetime"],
+        # money is tested against numeric in tests/test_cross_db_types.py. Its 4 decimals meet the
+        # ties where each database converts a float to decimal differently.
+        "float": ["numeric(6,2)", "float", "real"],
+        "uuid": ["varchar(100)", "char(100)", "univarchar(100)"],
+        "boolean": ["bit"],
+    },
 }
 
 
@@ -642,8 +653,14 @@ def _insert_to_table(conn, table_path, values, coltype):
         # Db2 truncates on insert, and the other databases round
         scale = int(coltype[:-1].split(",")[1])
         values = [(i, round(sample, scale)) for i, sample in values]
+    elif isinstance(conn, db.Sybase) and coltype.startswith("numeric("):
+        # ASE refuses a value with more digits than the column has, so round it as a copy from
+        # PostgreSQL would: from the 15 significant digits that PostgreSQL gives a float
+        scale = int(coltype[:-1].split(",")[1])
+        step = PyDecimal(1).scaleb(-scale)
+        values = [(i, PyDecimal(format(sample, ".15g")).quantize(step, ROUND_HALF_UP)) for i, sample in values]
     # mssql represents with int
-    elif isinstance(conn, db.MsSQL) and coltype in ("BIT"):
+    elif isinstance(conn, (db.MsSQL, db.Sybase)) and coltype.lower() == "bit":
         values = [(i, int(sample)) for i, sample in values]
 
     insert_rows_in_batches(conn, tbl, values, columns=["id", "col"])
@@ -668,7 +685,8 @@ def _create_table_with_indexes(conn, table_path, type_):
         conn.query(tbl.create())
 
     (index_id,) = table_path
-    if conn.dialect.SUPPORTS_INDEXES and type_ not in ("json", "jsonb", "array", "struct"):
+    # ASE can't index a bit column
+    if conn.dialect.SUPPORTS_INDEXES and type_ not in ("json", "jsonb", "array", "struct", "bit"):
         conn.query(f"CREATE INDEX xa_{index_id} ON {table_name} ({quote('id')}, {quote('col')})")
     if conn.dialect.SUPPORTS_INDEXES:
         conn.query(f"CREATE INDEX xb_{index_id} ON {table_name} ({quote('id')})")

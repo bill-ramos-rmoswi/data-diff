@@ -17,6 +17,9 @@ services:
       DATADIFF_MYSQL_URI: mysql://mysql:Password1@mysql/mysql
       DATADIFF_MSSQL_URI: mssql://sa:Password1@mssql:1433/testdb/dbo?TrustServerCertificate=yes
       DATADIFF_DB2_URI: db2://db2inst1:Password1@db2:50000/testdb/db2inst1
+      # Needs `docker compose --profile ase up -d --wait ase` from WSL, which needs GHCR access.
+      # Without it, unset this to skip ASE.
+      DATADIFF_SYBASE_URI: sybase://sa:Password1@ase:5000/testdb/dbo
     networks:
       - local
 

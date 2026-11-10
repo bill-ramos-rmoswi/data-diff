@@ -1,7 +1,8 @@
 FROM mcr.microsoft.com/devcontainers/python:3.11-bookworm
 
-# ODBC Driver 18 and sqlcmd/bcp for SQL Server, plus client libraries for the
-# other databases. ACCEPT_EULA accepts the Microsoft ODBC driver license.
+# ODBC Driver 18 and sqlcmd/bcp for SQL Server, FreeTDS for SAP ASE (TDS 5.0, with
+# tsql and freebcp), plus client libraries for the other databases.
+# ACCEPT_EULA accepts the Microsoft ODBC driver license.
 RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
         | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
@@ -9,6 +10,7 @@ RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
     && apt-get update \
     && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
         msodbcsql18 mssql-tools18 unixodbc-dev libpq-dev postgresql-client \
+        tdsodbc freetds-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # Poetry gets its own venv, so it can't conflict with project dependencies.
