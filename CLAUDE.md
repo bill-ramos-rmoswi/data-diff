@@ -32,7 +32,7 @@ From outside the compose network, SQL Server is on host port **14330**, because 
 - **License.** The SySAM grace period ends on **Sat 06 Feb 2027 20:46 UTC**, and ASE then shuts down. `sp_lmconfig` shows the date, and so does the error log at each start. A rebuild with `scripts/build.sh --no-cache` in the image repo renews it.
 - **Data** is in the named volume `ase-data` at `/opt/sap/data`, which holds every device, `master` included. Never bind-mount it, and put new devices there, or a recreated container won't know them. Server ASE, port 5000, `sa`/`Password1`, database `testdb`.
 - **Runtime setup** is `dev/ase/init.sql`, which `dev/ase/init.py` applies over TDS. `tests/common.py` runs it on every test run, because it's idempotent. It turns on `allow nulls by default` in `testdb`, raises the procedure cache to 120000 pages, and creates the read-only login `dd_reader`. The procedure cache setting lives in the container's `ASE.cfg`, not the volume, so a recreated container needs init again.
-- **Memory.** `mem_limit` is `${ASE_MEM:-2g}`, which the image's settings fit. For the 4 GB benchmark, recreate it with `ASE_MEM=4g` and raise `max memory` and the data cache at runtime (both dynamic).
+- **Memory.** `mem_limit` is `${ASE_MEM:-2g}`, which the image's settings fit (max memory 1.5 GB, data cache 768 MB). To try more, recreate it with `ASE_MEM=4g` and raise `max memory` and the data cache at runtime (both dynamic, lost when the container is recreated). For the perf tables this isn't worth it: see Performance tests.
 - From the devcontainer, use `tsql -H ase -p 5000 -U sa -P Password1` with `TDSVER=5.0`, or `freebcp`. `docker logs dd-ase` and `docker exec` work only from WSL.
 
 ## Commands
@@ -82,6 +82,8 @@ poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, wri
 `run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB, and the ASE trial runs in a container.
 
 With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sybase` loads it from the CSVs a previous run exported. ASE has no server-side load, so `freebcp` sends the rows over TDS into `perfdb`, which has its own devices `perfdata` (2,500 MB) and `perflog` (1,000 MB) in `/opt/sap/data`. Measured `sp_spaceused`: `fact_2x` 61 MB, `fact_13x` 399 MB. The primary key is added after the load, and `seed.py` checks counts, sums and the data-diff checksum against PostgreSQL. `run_perf.py` adds ASE in both directions against the other three. `PERF_PAIRS=Sybase:PostgreSQL,...` runs only some pairs, and `SYBASE_CONFIG` labels the results.
+
+The 2 GB defaults are enough. The perf tables (460 MB) already fit in the 768 MB data cache, and a run at `ASE_MEM=4g` with `max memory` at 3.25 GB and a 2 GB data cache was no faster. Timings on this machine vary by about 20% from one run to the next, so repeat a pair before treating a difference of that size as real.
 
 ## Database behavior that's easy to get wrong
 
