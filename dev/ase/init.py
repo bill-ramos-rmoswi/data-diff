@@ -24,15 +24,19 @@ def apply(uri: str = None, script: Path = INIT_SQL) -> None:
     from data_diff import connect
 
     db = connect(uri or os.environ.get("DATADIFF_SYBASE_URI") or DEFAULT_URI, shared=False)
-    try:
+
+    def run(conn):
         # One connection, because "use" applies to the batches after it
-        conn = db._queue.submit(lambda: db.thread_local.conn).result()
         cursor = conn.cursor()
         for batch in batches(script.read_text()):
             cursor.execute(batch)
             while cursor.nextset():
                 pass
         cursor.close()
+
+    try:
+        # Raises the ConnectError if the server can't be reached
+        db._run_on_connection(run)
     finally:
         db.close()
 

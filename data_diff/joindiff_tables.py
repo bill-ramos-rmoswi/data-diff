@@ -10,7 +10,7 @@ from itertools import chain
 import attrs
 
 from data_diff.databases import Database, Db2, MsSQL, MySQL, BigQuery, Presto, Oracle, Snowflake, DuckDB, Sybase
-from data_diff.abcs.database_types import NumericType, DbPath
+from data_diff.abcs.database_types import Integer, NumericType, DbPath
 from data_diff.databases.base import Compiler
 from data_diff.queries.api import (
     table,
@@ -24,7 +24,7 @@ from data_diff.queries.api import (
     this,
     when,
 )
-from data_diff.queries.ast_classes import Count, Expr, Random, TablePath, Code, ITable
+from data_diff.queries.ast_classes import Cast, Count, Expr, Random, TablePath, Code, ITable
 from data_diff.queries.extras import NormalizeAsString
 from data_diff.info_tree import InfoTree
 from data_diff.query_utils import append_to_table, drop_table
@@ -284,7 +284,12 @@ class JoinDiffer(TableDiffer):
             }
             if c in table_seg.key_columns
             else {
-                f"sum_{c}": sum_(this[c]),
+                # ASE sums an int as an int, which overflows on large tables
+                f"sum_{c}": sum_(
+                    Cast(this[c], Code("numeric(38, 0)"))
+                    if isinstance(db, Sybase) and isinstance(table_seg._schema[c], Integer)
+                    else this[c]
+                ),
                 # f"avg_{c}": avg(this[c]),
                 # f"min_{c}": min_(this[c]),
                 # f"max_{c}": max_(this[c]),

@@ -262,15 +262,15 @@ def load_into_sybase(name: str):
 def sybase_spaceused(conn, name: str) -> tuple:
     """(rows, reserved, data, index_size, unused) from sp_spaceused, which query() doesn't return."""
 
-    def run():
-        cursor = conn.thread_local.conn.cursor()
+    def run(raw):
+        cursor = raw.cursor()
         cursor.execute(f"EXEC sp_spaceused {name}")
         row = tuple(cursor.fetchone())
         while cursor.nextset():
             pass
         return row
 
-    return conn._queue.submit(run).result()[1:]
+    return conn._run_on_connection(run)[1:]
 
 
 @timed("Checked ASE against PostgreSQL")

@@ -17,7 +17,7 @@ from data_diff.databases.postgresql import PostgresqlDialect
 from data_diff.databases.sybase import Dialect as SybaseDialect
 from data_diff.diff_tables import Algorithm
 from data_diff.hashdiff_tables import HashDiffer
-from data_diff.queries.api import commit
+from data_diff.queries.api import commit, table
 from data_diff.utils import ArithUUID
 from tests.common import CONN_STRINGS, get_conn, random_table_suffix
 
@@ -35,7 +35,7 @@ class TypeTestCase(unittest.TestCase):
         for conn, table_sql in self.created:
             if isinstance(conn, db.Sybase):
                 # ASE has no DROP TABLE IF EXISTS
-                conn.query(f"IF object_id('{table_sql.strip('[]')}') IS NOT NULL DROP TABLE {table_sql}", None)
+                conn.query(table(table_sql.strip("[]")).drop(if_exists=True))
             else:
                 conn.query(f"DROP TABLE IF EXISTS {table_sql}", None)
             conn.query(commit)
@@ -602,8 +602,9 @@ class TestSybase(TypeTestCase):
         b = self.table(db.Sybase, "TEXT", "'x'", name="value_b")
         # Expressions stop at 16384 bytes, so the long value comes from the client
         conn.query(f"UPDATE {conn.dialect.quote(a)} SET v = '{'y' * 10000}'", None)
-        raw = conn._queue.submit(lambda: conn.thread_local.conn).result()
-        raw.cursor().execute(f"UPDATE {conn.dialect.quote(b)} SET v = ?", "y" * 20000)
+        conn._run_on_connection(
+            lambda raw: raw.cursor().execute(f"UPDATE {conn.dialect.quote(b)} SET v = ?", "y" * 20000)
+        )
         self.assertEqual(20000, conn.query(f"SELECT datalength(v) FROM {conn.dialect.quote(b)}", int))
         with self.assertRaisesRegex(QueryError, "text over 16384 bytes"):
             self.diff((db.Sybase, a), (db.Sybase, b))

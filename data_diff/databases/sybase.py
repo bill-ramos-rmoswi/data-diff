@@ -94,9 +94,12 @@ def import_sybase():
 @attrs.define(frozen=True)
 class SybaseText(Text):
     storage: str = attrs.field(default="varchar", kw_only=True)
+    # In characters, or None for text and unitext
     length: Optional[int] = attrs.field(default=None, kw_only=True)
 
 
+# The same fields on the refined types. A shared base can't hold them, because attrs classes
+# have slots, and two slotted bases with fields conflict.
 @attrs.define(frozen=True)
 class SybaseStringUUID(String_UUID):
     storage: str = attrs.field(default="varchar", kw_only=True)
@@ -157,12 +160,17 @@ def _unicode_literal(s: str) -> str:
 
 def _cp850_pua(x: str) -> str:
     """UTF-8 bytes of a cp850 varchar of up to CP850_CHUNK bytes, as varbinary."""
-    expr = f"convert(univarchar(8192), {x})"
+    # Converting to univarchar stops at the first NUL, and removing 00 bytes would drop it too,
+    # so NUL is escaped first: 01 becomes 01 03, then 00 becomes 01 02. Every 01 then starts a
+    # pair, and the UTF-8 bytes added below never contain 01, so the pairs decode back exactly.
+    escaped = f"str_replace(str_replace({x}, char(1), char(1) + char(3)), char(0), char(1) + char(2))"
+    expr = f"convert(univarchar(8192), {escaped})"
     for byte in range(128, 256):
         char = bytes([byte]).decode("cp850")
         pua = "+".join(f"to_unichar({0xE000 + b})" for b in char.encode("utf-8"))
         expr = f"str_replace({expr}, to_unichar({ord(char)}), {pua})"
-    return f"str_replace(str_replace(convert(varbinary(16384), {expr}), 0x00, null), 0xe0, null)"
+    stripped = f"str_replace(str_replace(convert(varbinary(16384), {expr}), 0x00, null), 0xe0, null)"
+    return f"str_replace(str_replace({stripped}, 0x0102, 0x00), 0x0103, 0x01)"
 
 
 def _utf16_unit(b: str, i: int) -> str:
@@ -447,13 +455,12 @@ class Dialect(BaseDialect):
 
     def _exact_bigdatetime(self, value: str, coltype: TemporalType) -> str:
         storage = _storage(coltype)
+        target = "bigtime" if isinstance(coltype, Time) else "bigdatetime"
         if storage not in TICK_STORAGE:
-            target = "bigtime" if isinstance(coltype, Time) else "bigdatetime"
             return value if storage in ("bigdatetime", "bigtime") else f"convert({target}, {value})"
         # datetime and time store 1/300 second ticks, which ASE reports as truncated milliseconds:
         # tick 299 is .996667, and ASE says .996. Recover the tick, and use its exact value, which
         # is also what SQL Server's datetime holds.
-        target = "bigtime" if isinstance(coltype, Time) else "bigdatetime"
         ms = f"datepart(ms, {value})"
         micros = f"((({ms} * 3 + 5) / 10) * 10000 + 1) / 3"
         return f"dateadd(us, {micros}, convert({target}, dateadd(ms, -{ms}, {value})))"
@@ -577,6 +584,7 @@ class Dialect(BaseDialect):
     def render_checksum(self, c: Compiler, elem: Checksum) -> str:
         pieces = []
         text_lengths = []
+        text_pieces = []
         # The most bytes a row can have, from the declared lengths, or None if one is unknown
         declared_bound = 0
         for expr in elem.exprs:
@@ -584,14 +592,13 @@ class Dialect(BaseDialect):
             normalized = self.compile(c, expr)
             raw = self.compile(c, expr.expr) if isinstance(expr, NormalizeAsString) else None
             piece = self._utf8(normalized, coltype, raw)
-            if self._prevent_overflow_when_concat:
-                piece = f"convert(varbinary(32), hash({piece}, 'md5'))"
             if _storage(coltype) is not None and not isinstance(coltype, TemporalType):
                 # UTF-8 takes up to 3 bytes for each cp850 byte, or for each UTF-16 code unit
                 factor = 2 if _storage(coltype) in UNICODE_STORAGE else 3
                 text_lengths.append(f"isnull(datalength({normalized}), 0) * {factor}")
                 length = getattr(coltype, "length", None)
                 declared_bound = None if length is None or declared_bound is None else declared_bound + 3 * length
+            text_pieces.append(_storage(coltype) is not None and not isinstance(coltype, TemporalType))
             if declared_bound is not None:
                 declared_bound += 64
             pieces.append(piece)
@@ -599,6 +606,18 @@ class Dialect(BaseDialect):
         if len(pieces) > 1:
             # '<null>' and '|', as other databases concatenate them
             pieces = [f"isnull({p}, 0x3c6e756c6c3e)" for p in pieces]
+            if self._prevent_overflow_when_concat:
+                # As BaseDialect.render_concat: the MD5 of each value, in hex, instead of the value.
+                # Each value must fit the limit by itself, which only text can exceed.
+                hashed = []
+                for p, is_text in zip(pieces, text_pieces):
+                    if is_text:
+                        too_long = _error(
+                            "a value over 16384 bytes can not be hashed on Sybase ASE", f"datalength({p})"
+                        )
+                        p = f"case when datalength({p}) < {MAX_EXPRESSION_BYTES} then {p} else convert(varbinary(1), {too_long}) end"
+                    hashed.append(f"convert(varbinary(32), hash({p}, 'md5'))")
+                pieces, text_lengths = hashed, []
             joined = " + 0x7c + ".join(pieces)
         else:
             (joined,) = pieces
@@ -669,8 +688,33 @@ class Sybase(ThreadedDatabase):
         # Unchained mode: each statement commits, and DDL isn't held in an open transaction.
         # textsize: raw text values are otherwise cut at 32 KB.
         cursor.execute("set chained off set textsize 2147483647")
+        # Hashing converts cp850 to UTF-8 with str_replace(), which follows the sort order. A sort
+        # order that ignores case or accents would replace the wrong characters, so it's refused.
+        cursor.execute(
+            "select cs.name, case when 'A' <> 'a' and str_replace(char(130), char(144), 'x') = char(130)"
+            " and str_replace(to_unichar(233), to_unichar(201), 'x') = to_unichar(233) then 1 else 0 end"
+            " from master..syscharsets cs where cs.type < 2000"
+            " and cs.id = (select value from master..sysconfigures where config = 131)"
+        )
+        charset, binary = cursor.fetchone()
         cursor.close()
+        if charset != "cp850" or not binary:
+            connection.close()
+            raise ConnectError(
+                f"data-diff supports Sybase ASE servers with the cp850 character set and a binary sort order, "
+                f"and this one has {charset}{'' if binary else ' with a sort order that ignores case or accents'}."
+            )
         return connection
+
+    def _run_on_connection(self, fn):
+        """Runs fn(pyodbc connection) in the worker thread that owns the connection."""
+
+        def run():
+            if self._init_error:
+                raise self._init_error
+            return fn(self.thread_local.conn)
+
+        return self._queue.submit(run).result()
 
     def select_table_schema(self, path: DbPath) -> str:
         """Provide SQL for selecting the table schema as (name, type, date_prec, num_prec, num_scale)"""
@@ -722,9 +766,13 @@ class Sybase(ThreadedDatabase):
             if refined is before or not isinstance(before, SybaseText):
                 continue
             cls = {String_UUID: SybaseStringUUID, String_VaryingAlphanum: SybaseAlphanum}.get(type(refined))
-            if cls is not None:
-                fields = {a.name: getattr(refined, a.name) for a in attrs.fields(type(refined)) if a.init}
-                col_dict[name] = cls(**fields, storage=before.storage, length=before.length)
+            if cls is None:
+                # A type without the storage would be hashed through the wrong path
+                logger.warning(f"Not refining {name} to {refined}, which this driver can't hash.")
+                col_dict[name] = before
+                continue
+            fields = {a.name: getattr(refined, a.name) for a in attrs.fields(type(refined)) if a.init}
+            col_dict[name] = cls(**fields, storage=before.storage, length=before.length)
         return col_dict
 
     def _query_cursor(self, c, sql_code: str):
@@ -738,6 +786,8 @@ class Sybase(ThreadedDatabase):
                     raise
                 logger.warning("Sybase ASE is out of procedure cache. Retrying in %ss.", delay)
                 time.sleep(delay)
+                # The failed cursor is closed
+                c = self.thread_local.conn.cursor()
         return self._query_cursor_once(c, sql_code)
 
     def _query_cursor_once(self, c, sql_code: str):

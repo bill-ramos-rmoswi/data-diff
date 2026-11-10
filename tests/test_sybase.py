@@ -9,14 +9,20 @@ from data_diff import databases as db
 from data_diff.databases.base import QueryError
 from data_diff.databases.sybase import Dialect, Sybase
 from data_diff.diff_tables import Algorithm
+from data_diff.queries.api import table
 from tests.common import CONN_STRINGS, random_table_suffix
 
 READER = {"user": "dd_reader", "password": "Reader#1@x/y"}
 
 
-def _raw(database):
-    """The pyodbc connection behind a single-threaded Sybase instance."""
-    return database._queue.submit(lambda: database.thread_local.conn).result()
+def reader_conf(**overrides) -> dict:
+    """A dict connection for the read-only login, on the server in DATADIFF_SYBASE_URI."""
+    from urllib.parse import urlsplit
+
+    uri = urlsplit(CONN_STRINGS.get(db.Sybase) or "sybase://ase:5000/testdb/dbo")
+    database = uri.path.split("/")[1] or "testdb"
+    conf = {"driver": "sybase", "host": uri.hostname, "port": uri.port or 5000, "database": database, "schema": "dbo"}
+    return {**conf, **READER, **overrides}
 
 
 class TestDialect(unittest.TestCase):
@@ -53,7 +59,7 @@ class TestSybaseDriver(unittest.TestCase):
 
     def tearDown(self):
         for suffix in ("", "_t", "_u"):
-            self.db.query(f"IF object_id('{self.name}{suffix}') IS NOT NULL DROP TABLE {self.name}{suffix}", None)
+            self.db.query(table(f"{self.name}{suffix}").drop(if_exists=True))
         self.db.close()
 
     def _other(self):
@@ -137,8 +143,7 @@ class TestSybaseLogins(unittest.TestCase):
 
     def _reader(self):
         # A dict, because a URI would need the password's @, / and # escaped, and URIs aren't decoded
-        conf = {"driver": "sybase", "host": "ase", "port": 5000, "database": "testdb", "schema": "dbo", **READER}
-        reader = connect(conf, shared=False)
+        reader = connect(reader_conf(), shared=False)
         self.addCleanup(reader.close)
         return reader
 
@@ -148,8 +153,9 @@ class TestSybaseLogins(unittest.TestCase):
     def test_read_only_login_can_diff(self):
         reader = self._reader()
         self.assertEqual(2, reader.query(f"SELECT count(*) FROM dbo.{self.name}", int))
-        conf = {"driver": "sybase", "host": "ase", "port": 5000, "database": "testdb", "schema": "dbo", **READER}
-        segments = [connect_to_table(conf, self.name, "id", thread_count=2, extra_columns=("v",)) for _ in range(2)]
+        segments = [
+            connect_to_table(reader_conf(), self.name, "id", thread_count=2, extra_columns=("v",)) for _ in range(2)
+        ]
         try:
             self.assertEqual([], list(diff_tables(*segments, algorithm=Algorithm.HASHDIFF)))
         finally:
@@ -165,16 +171,8 @@ class TestSybaseLogins(unittest.TestCase):
         self.assertEqual(2, self.admin.query(f"SELECT count(*) FROM {self.name}", int))
 
     def test_bad_password_is_a_connect_error(self):
-        conf = {
-            "driver": "sybase",
-            "host": "ase",
-            "port": 5000,
-            "database": "testdb",
-            "user": "dd_reader",
-            "password": "x",
-        }
-        with self.assertRaises(db.ConnectError):
-            connect(conf, shared=False).query("SELECT 1", int)
+        with self.assertRaisesRegex(db.ConnectError, "Login failed"):
+            connect(reader_conf(password="x"), shared=False).query("SELECT 1", int)
 
 
 @unittest.skipUnless(db.Sybase in CONN_STRINGS, "Needs a configured Sybase ASE")
@@ -208,7 +206,7 @@ class TestSybaseConcurrency(unittest.TestCase):
                     self.assertEqual(2, len(result))
         finally:
             for name in names:
-                admin.query(f"IF object_id('{name}') IS NOT NULL DROP TABLE {name}", None)
+                admin.query(table(name).drop(if_exists=True))
             admin.close()
 
 
@@ -220,3 +218,135 @@ class TestSybaseClass(unittest.TestCase):
             self.assertIn("ClientCharset=UTF-8", database._conn_str)
         finally:
             database.close()
+
+
+class TestReviewFindings(unittest.TestCase):
+    """Each test failed before its fix."""
+
+    def test_retry_after_procedure_cache_error_uses_a_new_cursor(self):
+        import pyodbc
+
+        class Cursor:
+            calls = 0
+
+            def __init__(self):
+                self.closed = False
+                self.description = None
+
+            def execute(self, sql):
+                if self.closed:
+                    raise pyodbc.ProgrammingError("HY010", "Attempt to use a closed cursor")
+                Cursor.calls += 1
+                if Cursor.calls == 1:
+                    raise pyodbc.ProgrammingError("42000", "There is not enough procedure cache (701)")
+
+            def nextset(self):
+                return False
+
+            def cancel(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+        database = Sybase(host="ase", user="u", password="p", database="d", thread_count=1)
+        try:
+            database._pyodbc = pyodbc
+            database.thread_local.conn = Connection()
+            database._query_cursor(Cursor(), "UPDATE t SET v = 1")
+            self.assertEqual(2, Cursor.calls)
+        finally:
+            del database.thread_local.conn
+            database.close()
+
+    def test_unreachable_server_explains_itself(self):
+        import subprocess
+        import sys
+
+        env = {**__import__("os").environ, "DATADIFF_SYBASE_URI": "sybase://sa:x@127.0.0.1:1/testdb/dbo"}
+        result = subprocess.run([sys.executable, "-c", "import tests.common"], env=env, capture_output=True, text=True)
+        self.assertIn("Can't connect to SAP ASE", result.stderr)
+
+
+@unittest.skipUnless(db.Sybase in CONN_STRINGS, "Needs a configured Sybase ASE")
+class TestReviewFindingsOnServer(unittest.TestCase):
+    def setUp(self):
+        self.db = connect(CONN_STRINGS[db.Sybase], shared=False)
+        self.names = []
+
+    def tearDown(self):
+        for conn, name in self.names:
+            conn.query(table(name).drop(if_exists=True))
+        self.db.close()
+
+    def _table(self, conn, columns: str, rows, name=None):
+        name = name or f"rf{random_table_suffix()}"
+        conn.query(f"CREATE TABLE {name} ({columns})", None)
+        self.names.append((conn, name))
+        for row in rows:
+            conn.query(f"INSERT INTO {name} VALUES ({row})", None)
+        return name
+
+    def test_joindiff_stats_sum_large_integers(self):
+        rows = [f"{i}, 2000000000" for i in range(3)]
+        a = self._table(self.db, "id INT NOT NULL PRIMARY KEY, v INT NULL", rows)
+        b = self._table(self.db, "id INT NOT NULL PRIMARY KEY, v INT NULL", rows)
+        segments = [
+            connect_to_table(CONN_STRINGS[db.Sybase], n, "id", extra_columns=("v",), thread_count=2) for n in (a, b)
+        ]
+        try:
+            diff = diff_tables(*segments, algorithm=Algorithm.JOINDIFF)
+            self.assertEqual([], list(diff))
+            self.assertEqual(6000000000, diff.stats["table1_sum_v"])
+        finally:
+            for segment in segments:
+                segment.database.close()
+
+    def test_nul_characters_are_hashed(self):
+        a = self._table(
+            self.db, "id INT NOT NULL PRIMARY KEY, v VARCHAR(10) NULL", [f"{i}, 'é' + char(0)" for i in range(10)]
+        )
+        b = self._table(self.db, "id INT NOT NULL PRIMARY KEY, v VARCHAR(10) NULL", [f"{i}, 'é'" for i in range(10)])
+        segments = [
+            connect_to_table(CONN_STRINGS[db.Sybase], n, "id", extra_columns=("v",), thread_count=2) for n in (a, b)
+        ]
+        try:
+            checksums = [s.with_schema().count_and_checksum() for s in segments]
+            self.assertNotEqual(checksums[0], checksums[1])
+        finally:
+            for segment in segments:
+                segment.database.close()
+
+    @unittest.skipUnless(db.PostgreSQL in CONN_STRINGS, "Needs PostgreSQL")
+    def test_overflow_prevention_matches_postgresql(self):
+        pg = connect(CONN_STRINGS[db.PostgreSQL], shared=False)
+        self.addCleanup(pg.close)
+        name = f"rf{random_table_suffix()}"
+        self._table(
+            self.db, "id INT NOT NULL PRIMARY KEY, v VARCHAR(10) NULL, w INT NULL", ["1, 'é', NULL", "2, NULL, 5"], name
+        )
+        self._table(pg, "id INT NOT NULL PRIMARY KEY, v VARCHAR(10), w INT", ["1, 'é', NULL", "2, NULL, 5"], name)
+        pg.query("COMMIT", None)
+        for columns in (("v", "w"), ()):
+            segments = [
+                connect_to_table(uri, name, "id", extra_columns=columns, thread_count=2)
+                for uri in (CONN_STRINGS[db.Sybase], CONN_STRINGS[db.PostgreSQL])
+            ]
+            try:
+                for segment in segments:
+                    segment.database.dialect.enable_preventing_type_overflow()
+                checksums = [s.with_schema().count_and_checksum() for s in segments]
+                self.assertEqual(checksums[0], checksums[1], columns)
+            finally:
+                for segment in segments:
+                    segment.database.close()
+
+    def test_logins_use_the_configured_server(self):
+        from urllib.parse import urlsplit
+
+        uri = urlsplit(CONN_STRINGS[db.Sybase])
+        self.assertEqual((uri.hostname, uri.port or 5000), (reader_conf()["host"], reader_conf()["port"]))
