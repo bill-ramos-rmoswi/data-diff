@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import math
@@ -22,6 +23,33 @@ from rich.status import Status
 
 
 # -- Common --
+
+
+# Large values are compared by a digest that every database can compute in pieces, because
+# SAP ASE and Db2 can't hash a whole large value. Text is split by character and hashed as UTF-8.
+TEXT_DIGEST_CHUNK = 4096
+BINARY_DIGEST_CHUNK = 8192
+DIGEST_HEXDIGITS = 12
+
+
+def lob_digest(value: Union[str, bytes, bytearray, memoryview, None]) -> Optional[str]:
+    """The digest of a large text or binary value, as each database computes it in SQL.
+
+    It's the sum, over the chunks of the value, of the last 12 hex digits of
+    ``md5(<chunk index> + '|' + <chunk>)``. The index makes the order of the chunks matter.
+    An empty value is ``'0'``, and NULL stays NULL.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        chunks = (value[i : i + TEXT_DIGEST_CHUNK].encode("utf-8") for i in range(0, len(value), TEXT_DIGEST_CHUNK))
+    else:
+        value = bytes(value)
+        chunks = (value[i : i + BINARY_DIGEST_CHUNK] for i in range(0, len(value), BINARY_DIGEST_CHUNK))
+    total = 0
+    for index, chunk in enumerate(chunks):
+        total += int(hashlib.md5(str(index).encode("ascii") + b"|" + chunk).hexdigest()[-DIGEST_HEXDIGITS:], 16)
+    return str(total)
 
 
 def join_iter(joiner: Any, iterable: Iterable) -> Iterable:

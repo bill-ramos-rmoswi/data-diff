@@ -271,10 +271,36 @@ class String_FixedAlphanum(String_Alphanum):
 
 
 @attrs.define(frozen=True)
+class DigestSource:
+    """Marks a column that's compared by ``data_diff.utils.lob_digest`` instead of by its value.
+
+    Some databases can only read a large value through a subquery on its own table, which needs
+    the table and its key columns.
+    """
+
+    table_path: DbPath
+    key_columns: Tuple[str, ...]
+    # When true, a value the database can't hash is left for the client: its digest is NULL, and
+    # ``digest_needs_client`` selects it. When false, the query fails on such a value.
+    client: bool = False
+
+
+@attrs.define(frozen=True)
 class Text(StringType):
+    digest: Optional[DigestSource] = attrs.field(default=None, kw_only=True)
+
     @property
     def supported(self) -> bool:
-        return False
+        # A digest is computed the same way by every database
+        return self.digest is not None
+
+
+@attrs.define(frozen=True)
+class Binary(ColType):
+    """Bytes of any length. Always compared by digest, so no driver renders them as text."""
+
+    python_type = bytes
+    digest: Optional[DigestSource] = attrs.field(default=None, kw_only=True)
 
 
 # In majority of DBMSes, it is called JSON/JSONB. Only in Snowflake, it is OBJECT.

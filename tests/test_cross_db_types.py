@@ -18,7 +18,7 @@ from data_diff.databases.sybase import Dialect as SybaseDialect
 from data_diff.diff_tables import Algorithm
 from data_diff.hashdiff_tables import HashDiffer
 from data_diff.queries.api import commit, table
-from data_diff.utils import ArithUUID
+from data_diff.utils import ArithUUID, lob_digest
 from tests.common import CONN_STRINGS, get_conn, random_table_suffix
 
 
@@ -193,12 +193,15 @@ class TestDb2(TypeTestCase):
         b = self.table(db.Db2, "DECFLOAT(16)", *values, name="value_b")
         self.assertEqual([], self.diff((db.Db2, a), (db.Db2, b)))
 
-    def test_long_clob_fails_with_an_explanation(self):
+    def test_long_clob(self):
+        # HASH takes at most 32,672 bytes, so a CLOB is compared by a digest of its chunks
         long_text = "CLOB(REPEAT('a', 32000)) || CLOB(REPEAT('a', 8000))"
-        a = self.table(db.Db2, "CLOB(100K)", long_text, name="value_a")
-        b = self.table(db.Db2, "CLOB(100K)", long_text, name="value_b")
-        with self.assertRaisesRegex(QueryError, "32,672 bytes"):
-            self.diff((db.Db2, a), (db.Db2, b))
+        changed = "CLOB(REPEAT('a', 32000)) || CLOB(REPEAT('a', 7999)) || 'b'"
+        a = self.table(db.Db2, "CLOB(100K)", long_text, long_text, name="value_a")
+        b = self.table(db.Db2, "CLOB(100K)", long_text, changed, name="value_b")
+        for algorithm in (Algorithm.HASHDIFF, Algorithm.ROWHASH):
+            diff = self.diff((db.Db2, a), (db.Db2, b), algorithm=algorithm)
+            self.assertEqual(["2", "2"], [row[0] for _, row in diff])
 
 
 class JoinDiffCases:
@@ -289,6 +292,41 @@ def pg(value) -> str:
 
 def ms(value) -> str:
     return "NULL" if value is None else "N'" + value.replace("'", "''") + "'"
+
+
+def set_large_value(db_cls, table_name, row_id, value):
+    """Stores a str or bytes of any length in column v. ASE takes at most 16384 bytes in a
+    statement, so there the value is sent as a parameter."""
+    conn = get_conn(db_cls)
+    name = conn.dialect.quote(table_name)
+    if db_cls is db.Sybase:
+        sql = f"UPDATE {name} SET v = ? WHERE id = {row_id}"
+        conn._run_on_connection(lambda raw: raw.cursor().execute(sql, value))
+    else:
+        if db_cls is db.Db2:
+            # A Db2 literal holds at most 32,672 bytes, so the value is built from pieces.
+            # The names are quoted, because Db2 stores them in the case they were created with.
+            v, row = conn.dialect.quote("v"), f"{conn.dialect.quote('id')} = {row_id}"
+            empty = "EMPTY_CLOB()" if isinstance(value, str) else "EMPTY_BLOB()"
+            conn.query(f"UPDATE {name} SET {v} = {empty} WHERE {row}", None)
+            for start in range(0, len(value), 8000):
+                piece = value[start : start + 8000]
+                literal = pg(piece) if isinstance(piece, str) else f"BX'{piece.hex()}'"
+                conn.query(f"UPDATE {name} SET {v} = {v} || {literal} WHERE {row}", None)
+            conn.query(commit)
+            return
+        if db_cls is db.MsSQL:
+            literal = ms(value) if isinstance(value, str) else f"0x{value.hex()}"
+        else:
+            literal = pg(value) if isinstance(value, str) else f"decode('{value.hex()}', 'hex')"
+        conn.query(f"UPDATE {name} SET v = {literal} WHERE id = {row_id}", None)
+        conn.query(commit)
+
+
+def pattern(length: int, step: int = 7) -> str:
+    """Text that differs from chunk to chunk"""
+    line = "".join(chr(97 + (k * step) % 26) for k in range(1009))
+    return (line * (length // len(line) + 1))[:length]
 
 
 TEXTS = ["plain", "café", "Ünïcödé", CP850_HIGH[:60], CP850_HIGH[60:], "it's", "a|b", "<null>", None]
@@ -481,6 +519,247 @@ class TestSybaseAgainstPostgreSQL(TypeTestCase):
         del conn
 
 
+@requires(db.Sybase, db.PostgreSQL)
+class TestSybaseLargeValuesAgainstPostgreSQL(TypeTestCase):
+    """text, unitext and image hold up to 2 GB, and ASE can't hash more than 16384 bytes at once,
+    so both sides compare them by ``lob_digest``, which is computed in chunks."""
+
+    ASE_SERVER_LIMIT = 1025 * 4096
+    SOURCE = db.Sybase
+    TARGET = db.PostgreSQL
+
+    def tables(self, source_type, target_type, values, target_values=None):
+        """A table on each server, with the values in column v. Returns (class, name) pairs."""
+        pairs = []
+        sides = (
+            (self.SOURCE, source_type, values, "value_a"),
+            (self.TARGET, target_type, target_values or values, "value_b"),
+        )
+        for db_cls, column_type, side, table_name in sides:
+            name = self.table(db_cls, column_type, *["NULL"] * len(side), name=table_name)
+            for row_id, value in enumerate(side, 1):
+                if value is not None:
+                    set_large_value(db_cls, name, row_id, value)
+            pairs.append((db_cls, name))
+        return pairs
+
+    def assert_equal_with_both_algorithms(self, a, b):
+        self.assert_matches(a, b)
+        self.assertEqual([], self.diff(a, b, algorithm=Algorithm.ROWHASH))
+        self.assertEqual([], self.diff(b, a, algorithm=Algorithm.ROWHASH))
+
+    def assert_differ_with_both_algorithms(self, a, b, ids):
+        expected = sorted(ids * 2)
+        for x, y in ((a, b), (b, a)):
+            for algorithm in (Algorithm.HASHDIFF, Algorithm.ROWHASH):
+                diff = self.diff(x, y, algorithm=algorithm)
+                self.assertEqual(expected, sorted(row[0] for _, row in diff), f"{algorithm} {x[0].__name__}")
+
+    def test_text_of_every_chunk_count(self):
+        lengths = [1, 4095, 4096, 4097, 8192, 16384, 16385, 100_000, 1_000_000]
+        values = [pattern(n) for n in lengths] + [None]
+        a, b = self.tables("TEXT", "TEXT", values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+    def test_the_digest_is_the_one_python_computes(self):
+        values = [pattern(n) for n in (1, 4096, 4097, 50_000)] + ["é" * 5000 + pattern(5000)]
+        a, b = self.tables("TEXT", "TEXT", values)
+        expected = [(str(i), lob_digest(v)) for i, v in enumerate(values, 1)]
+        segments = [
+            connect_to_table(CONN_STRINGS[db_cls], name, ("id",), extra_columns=("v",), thread_count=2).with_schema()
+            for db_cls, name in (a, b)
+        ]
+        try:
+            HashDiffer()._validate_and_adjust_columns(*segments)
+            for segment in segments:
+                rows = sorted(segment.get_values(), key=lambda row: int(row[0]))
+                self.assertEqual(expected, [tuple(row) for row in rows], segment.database.name)
+        finally:
+            for segment in segments:
+                segment.database.close()
+
+    def test_text_outside_ascii(self):
+        values = ["é" * 5000 + "ñ" * 5000, CP850_HIGH * 200, "x" * 4095 + "é" + "y" * 4096]
+        a, b = self.tables("TEXT", "TEXT", values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+    def test_spaces_at_the_end_of_a_chunk(self):
+        values = [("x" * 4090 + " " * 6) * 12, " " * 5000, "x" * 4096 + " " * 4096, "abc   "]
+        a, b = self.tables("TEXT", "TEXT", values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+    def test_differences_in_long_text_are_reported(self):
+        text = pattern(100_000)
+        chunks = [text[i : i + 4096] for i in range(0, len(text), 4096)]
+        swapped = "".join([chunks[1], chunks[0]] + chunks[2:])
+        values = [text, text, text, text + " ", text, None]
+        changed = [text[:-1] + "!", "!" + text[1:], swapped, text, text[:-1], ""]
+        a, b = self.tables("TEXT", "TEXT", values, changed)
+        self.assert_differ_with_both_algorithms(a, b, ["1", "2", "3", "4", "5", "6"])
+
+    def test_image_against_bytea(self):
+        lengths = [1, 8191, 8192, 8193, 16384, 100_000, 1_000_000]
+        values = [pattern(n).encode() for n in lengths]
+        # Zero bytes at the end of a chunk, and of the value
+        values += [(b"q" * 8190 + b"\x00\x00") * 6, bytes(range(256)) * 100, None]
+        a, b = self.tables("IMAGE", "BYTEA", values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+    def test_differences_in_image_are_reported(self):
+        data = pattern(100_000).encode()
+        values = [data, data, data, None]
+        changed = [data[:-1] + b"!", b"!" + data[1:], data + b"\x00", b"x"]
+        a, b = self.tables("IMAGE", "BYTEA", values, changed)
+        self.assert_differ_with_both_algorithms(a, b, ["1", "2", "3", "4"])
+
+    def test_varbinary_against_bytea(self):
+        values = ["0x00ab", "0xff", "0x" + "c3a9" * 100, "NULL"]
+        a = self.table(db.Sybase, "VARBINARY(300)", *values)
+        b = self.table(db.PostgreSQL, "BYTEA", "'\\x00ab'", "'\\xff'", "'\\x" + "c3a9" * 100 + "'", "NULL")
+        self.assert_equal_with_both_algorithms((db.Sybase, a), (db.PostgreSQL, b))
+
+    def test_differences_in_varbinary_are_reported(self):
+        a = self.table(db.Sybase, "VARBINARY(300)", "0x00ab", "0xff", "NULL")
+        b = self.table(db.PostgreSQL, "BYTEA", "'\\x00ac'", "'\\xff00ff'", "'\\x00'")
+        self.assert_differ_with_both_algorithms((db.Sybase, a), (db.PostgreSQL, b), ["1", "2", "3"])
+
+    def test_text_over_the_server_limit_needs_rowhash(self):
+        text = pattern(self.ASE_SERVER_LIMIT + 1)
+        a, b = self.tables("TEXT", "TEXT", [text, "short"])
+        with self.assertRaisesRegex(QueryError, "rowhash"):
+            self.diff(a, b)
+        self.assertEqual([], self.diff(a, b, algorithm=Algorithm.ROWHASH))
+        self.assertEqual([], self.diff(b, a, algorithm=Algorithm.ROWHASH))
+
+        set_large_value(db.PostgreSQL, b[1], 1, text[:-1] + "!")
+        diff = self.diff(a, b, algorithm=Algorithm.ROWHASH)
+        self.assertEqual(["1", "1"], [row[0] for _, row in diff])
+        # The rows carry the digests, not the values
+        self.assertEqual({lob_digest(text), lob_digest(text[:-1] + "!")}, {row[1] for _, row in diff})
+
+    def test_a_large_value_against_null_is_reported(self):
+        # The server leaves the value to the client, and its digest is NULL until then
+        text = pattern(self.ASE_SERVER_LIMIT + 1)
+        a, b = self.tables("TEXT", "TEXT", [text], [None])
+        self.assertEqual(2, len(self.diff(a, b, algorithm=Algorithm.ROWHASH)))
+
+    def test_unitext_in_cp850(self):
+        values = ["abc ", "é" * 3000, pattern(4096), " "]
+        a = self.table(db.Sybase, "UNITEXT", *map(ase, values))
+        b = self.table(db.PostgreSQL, "TEXT", *map(pg, values))
+        self.assert_equal_with_both_algorithms((db.Sybase, a), (db.PostgreSQL, b))
+
+    def test_unitext_that_only_the_client_can_hash(self):
+        # Over one chunk, or outside cp850 and over the limit of the conversion to UTF-8
+        a = self.table(
+            db.Sybase, "UNITEXT", "replicate(U&'\\65E5', 5000)", "replicate(U&'\\65E5', 200)", ase("日本語"), "NULL"
+        )
+        b = self.table(db.PostgreSQL, "TEXT", "repeat('日', 5000)", "repeat('日', 200)", pg("日本語"), "NULL")
+        a, b = (db.Sybase, a), (db.PostgreSQL, b)
+        with self.assertRaisesRegex(QueryError, "rowhash|Unicode text over"):
+            self.diff(a, b)
+        self.assertEqual([], self.diff(a, b, algorithm=Algorithm.ROWHASH))
+        self.assertEqual([], self.diff(b, a, algorithm=Algorithm.ROWHASH))
+
+        conn = get_conn(db.PostgreSQL)
+        conn.query(f"UPDATE {conn.dialect.quote(b[1])} SET v = repeat('日', 4999) || '本' WHERE id = 1", None)
+        conn.query(commit)
+        diff = self.diff(a, b, algorithm=Algorithm.ROWHASH)
+        self.assertEqual(["1", "1"], [row[0] for _, row in diff])
+
+    def test_long_text_against_itself(self):
+        names = []
+        for name, second in (("value_a", pattern(50_000, step=11)), ("value_b", pattern(50_000))):
+            names.append(self.table(db.Sybase, "TEXT", "NULL", "NULL", "NULL", name=name))
+            set_large_value(db.Sybase, names[-1], 1, pattern(50_000))
+            set_large_value(db.Sybase, names[-1], 2, second)
+        a, b = [(db.Sybase, name) for name in names]
+        self.assertEqual(2, len(self.diff(a, b)))
+        self.assertEqual(2, len(self.diff(a, b, algorithm=Algorithm.ROWHASH)))
+
+
+class LargeValueCases:
+    """Large text and bytes between two databases, of which neither needs the client."""
+
+    SOURCE = None
+    TARGET = None
+    TEXT = {db.Sybase: "TEXT", db.PostgreSQL: "TEXT", db.MsSQL: "NVARCHAR(MAX)", db.Db2: "CLOB(10M)"}
+    BYTES = {db.Sybase: "IMAGE", db.PostgreSQL: "BYTEA", db.MsSQL: "VARBINARY(MAX)", db.Db2: "BLOB(10M)"}
+
+    tables = TestSybaseLargeValuesAgainstPostgreSQL.tables
+    assert_equal_with_both_algorithms = TestSybaseLargeValuesAgainstPostgreSQL.assert_equal_with_both_algorithms
+    assert_differ_with_both_algorithms = TestSybaseLargeValuesAgainstPostgreSQL.assert_differ_with_both_algorithms
+
+    def test_text(self):
+        lengths = [1, 4095, 4096, 4097, 16385, 100_000, 1_000_000]
+        values = [pattern(n) for n in lengths] + ["é" * 5000 + "ñ" * 5000, ("x" * 4090 + " " * 6) * 12, None]
+        a, b = self.tables(self.TEXT[self.SOURCE], self.TEXT[self.TARGET], values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+    def test_text_differences(self):
+        text = pattern(100_000)
+        values = [text, text, text + " ", None]
+        changed = [text[:-1] + "!", "!" + text[1:], text, "x"]
+        a, b = self.tables(self.TEXT[self.SOURCE], self.TEXT[self.TARGET], values, changed)
+        self.assert_differ_with_both_algorithms(a, b, ["1", "2", "3", "4"])
+
+    def test_bytes(self):
+        lengths = [1, 8191, 8192, 8193, 100_000, 1_000_000]
+        values = [pattern(n).encode() for n in lengths] + [
+            (b"q" * 8190 + b"\x00\x00") * 6,
+            bytes(range(256)) * 100,
+            None,
+        ]
+        a, b = self.tables(self.BYTES[self.SOURCE], self.BYTES[self.TARGET], values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+    def test_bytes_differences(self):
+        data = pattern(100_000).encode()
+        a, b = self.tables(
+            self.BYTES[self.SOURCE],
+            self.BYTES[self.TARGET],
+            [data, data, None],
+            [data[:-1] + b"!", data + b"\x00", b"x"],
+        )
+        self.assert_differ_with_both_algorithms(a, b, ["1", "2", "3"])
+
+
+@requires(db.MsSQL, db.PostgreSQL)
+class TestLargeValuesMsSQLAgainstPostgreSQL(LargeValueCases, TypeTestCase):
+    SOURCE = db.MsSQL
+    TARGET = db.PostgreSQL
+
+    def test_text_outside_the_basic_multilingual_plane(self):
+        # NVARCHAR counts a surrogate pair as two, and the other databases count one character
+        values = ["\U0001f600" * 5000 + "end", "日本" * 9000, "x" * 4095 + "\U0001f600" + "y" * 5000]
+        a, b = self.tables("NVARCHAR(MAX)", "TEXT", values)
+        self.assert_equal_with_both_algorithms(a, b)
+
+
+@requires(db.Db2, db.PostgreSQL)
+class TestLargeValuesDb2AgainstPostgreSQL(LargeValueCases, TypeTestCase):
+    SOURCE = db.Db2
+    TARGET = db.PostgreSQL
+
+
+@requires(db.Sybase, db.Db2)
+class TestLargeValuesSybaseAgainstDb2(LargeValueCases, TypeTestCase):
+    SOURCE = db.Sybase
+    TARGET = db.Db2
+
+
+@requires(db.MsSQL, db.Db2)
+class TestLargeValuesMsSQLAgainstDb2(LargeValueCases, TypeTestCase):
+    SOURCE = db.MsSQL
+    TARGET = db.Db2
+
+
+@requires(db.Sybase, db.MsSQL)
+class TestLargeValuesSybaseAgainstMsSQL(LargeValueCases, TypeTestCase):
+    SOURCE = db.Sybase
+    TARGET = db.MsSQL
+
+
 @requires(db.Sybase, db.MsSQL)
 class TestSybaseAgainstMsSQL(TypeTestCase):
     def test_unicode_text(self):
@@ -596,20 +875,28 @@ class TestSybase(TypeTestCase):
         with self.assertRaisesRegex(QueryError, "Unicode text over 255 characters"):
             self.diff((db.Sybase, a), (db.Sybase, b))
 
-    def test_text_over_the_expression_limit_fails_with_an_explanation(self):
+    def test_text_over_the_expression_limit(self):
         conn = get_conn(db.Sybase)
         a = self.table(db.Sybase, "TEXT", "'x'", name="value_a")
         b = self.table(db.Sybase, "TEXT", "'x'", name="value_b")
         # Expressions stop at 16384 bytes, so the long value comes from the client
         conn.query(f"UPDATE {conn.dialect.quote(a)} SET v = '{'y' * 10000}'", None)
-        conn._run_on_connection(
-            lambda raw: raw.cursor().execute(f"UPDATE {conn.dialect.quote(b)} SET v = ?", "y" * 20000)
-        )
+        set_large_value(db.Sybase, b, 1, "y" * 20000)
         self.assertEqual(20000, conn.query(f"SELECT datalength(v) FROM {conn.dialect.quote(b)}", int))
-        with self.assertRaisesRegex(QueryError, "text over 16384 bytes"):
-            self.diff((db.Sybase, a), (db.Sybase, b))
+        self.assertEqual(2, len(self.diff((db.Sybase, a), (db.Sybase, b))))
+        set_large_value(db.Sybase, a, 1, "y" * 20000)
+        self.assertEqual([], self.diff((db.Sybase, a), (db.Sybase, b)))
+        self.assertEqual([], self.diff((db.Sybase, a), (db.Sybase, b), algorithm=Algorithm.ROWHASH))
 
-    def test_rows_over_the_hash_limit_fail_with_an_explanation(self):
+    def test_joindiff_still_explains_the_limit_on_text(self):
+        # joindiff compares the values themselves, in one expression
+        a = self.table(db.Sybase, "TEXT", "'x'", name="value_a")
+        b = self.table(db.Sybase, "TEXT", "'x'", name="value_b")
+        set_large_value(db.Sybase, b, 1, "y" * 20000)
+        with self.assertRaisesRegex(QueryError, "text over 16384 bytes"):
+            self.diff((db.Sybase, a), (db.Sybase, b), algorithm=Algorithm.JOINDIFF)
+
+    def test_rows_of_long_text_columns(self):
         conn = get_conn(db.Sybase)
         q = conn.dialect.quote
         names = []
@@ -626,8 +913,9 @@ class TestSybase(TypeTestCase):
             for n in names
         ]
         try:
-            with self.assertRaisesRegex(QueryError, "a row over 16384 bytes"):
-                list(diff_tables(*segments, bisection_factor=2, bisection_threshold=4, algorithm=Algorithm.HASHDIFF))
+            # Each text column is hashed by itself, so together they aren't limited to an expression
+            diff = list(diff_tables(*segments, bisection_factor=2, bisection_threshold=4, algorithm=Algorithm.HASHDIFF))
+            self.assertEqual([], diff)
         finally:
             for segment in segments:
                 segment.database.close()

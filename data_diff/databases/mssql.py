@@ -16,6 +16,9 @@ from data_diff.databases.base import (
 )
 from data_diff.abcs.database_types import (
     JSON,
+    Binary,
+    DigestSource,
+    StringType,
     ColType_UUID,
     FractionalType,
     Timestamp,
@@ -35,7 +38,7 @@ from data_diff.abcs.database_types import (
 )
 from data_diff.queries.ast_classes import Code, Concat, CreateTable, Expr
 from data_diff.queries.extras import NormalizeAsString
-from data_diff.utils import join_iter
+from data_diff.utils import BINARY_DIGEST_CHUNK, TEXT_DIGEST_CHUNK, join_iter
 
 
 @import_helper("mssql")
@@ -77,8 +80,10 @@ class Dialect(BaseDialect):
         "ntext": Text,
         "nvarchar": Text,
         "nchar": Text,
-        "binary": Text,
-        "varbinary": Text,
+        # Bytes. timestamp and rowversion are row versions, which a copy of the row doesn't keep.
+        "binary": Binary,
+        "varbinary": Binary,
+        "image": Binary,
         "xml": Text,
         # UUID
         "uniqueidentifier": Native_UUID,
@@ -255,6 +260,58 @@ class Dialect(BaseDialect):
 
     def md5_as_hex(self, s: str) -> str:
         return f"LOWER(CONVERT(VARCHAR(32), {self._hash_md5(s)}, 2))"
+
+    # Large values. HASHBYTES takes a value of any size, but the digest must match databases
+    # that can only hash a piece at a time, so it's computed in the same pieces.
+
+    # SQL Server can't aggregate over an expression that contains a subquery
+    DIGEST_IN_SUBQUERY: ClassVar[bool] = True
+
+    def as_digest_type(self, coltype: ColType, source: DigestSource) -> ColType:
+        if isinstance(coltype, (StringType, ColType_UUID)) and not isinstance(coltype, Native_UUID):
+            # Whatever sampling refined the column to, the other side holds plain text
+            return Text(digest=source)
+        return super().as_digest_type(coltype, source)
+
+    @staticmethod
+    def _digest_sum(md5: str, chunk: str, last_chunk: str) -> str:
+        # The last 6 bytes of the MD5, which are the 12 hex digits other databases read. The sum
+        # is over a derived table, because an aggregate can't mix an outer column with s.value.
+        # GENERATE_SERIES needs SQL Server 2022.
+        term = f"CASE WHEN DATALENGTH({chunk}) > 0 THEN CONVERT(BIGINT, SUBSTRING({md5}, 11, 6)) ELSE 0 END"
+        return (
+            f"(SELECT CONVERT(VARCHAR(30), SUM(x.term)) FROM (SELECT {term} AS term"
+            f" FROM GENERATE_SERIES(CONVERT(BIGINT, 0), CONVERT(BIGINT, {last_chunk})) s) x)"
+        )
+
+    def normalize_digest(self, value: str, coltype: ColType) -> str:
+        if isinstance(coltype, Binary):
+            n = BINARY_DIGEST_CHUNK
+            v = f"CONVERT(VARBINARY(MAX), {value})"
+            chunk = f"SUBSTRING({v}, s.value * {n} + 1, {n})"
+            md5 = f"HASHBYTES('MD5', CONVERT(VARBINARY(13), CONVERT(VARCHAR(12), s.value) + '|') + {chunk})"
+            chunks = self._digest_sum(md5, chunk, f"(DATALENGTH({v}) - 1) / {n}")
+            return f"CASE WHEN {value} IS NULL THEN NULL WHEN DATALENGTH({v}) = 0 THEN '0' ELSE {chunks} END"
+
+        n = TEXT_DIGEST_CHUNK
+        v = f"CONVERT(NVARCHAR(MAX), {value})"
+
+        def chunks_of(text: str) -> str:
+            chunk = f"SUBSTRING({text}, s.value * {n} + 1, {n})"
+            md5 = self._hash_md5(f"CONVERT(NVARCHAR(12), s.value) + N'|' + {chunk}")
+            # A value with surrogate pairs has fewer characters than this, and the chunks past
+            # its end are empty
+            return self._digest_sum(md5, chunk, f"(DATALENGTH({v}) / 2 - 1) / {n}")
+
+        # Other databases cut text by character. NVARCHAR is cut by UTF-16 code unit, which is
+        # the same unless the text has surrogate pairs. A collation that knows them cuts by
+        # character, but has to read the text from its start for each chunk.
+        has_surrogates = f"{v} COLLATE Latin1_General_BIN2 LIKE N'%[' + NCHAR(55296) + N'-' + NCHAR(56319) + N']%'"
+        by_character = chunks_of(f"{v} COLLATE Latin1_General_100_CI_AS_SC")
+        return (
+            f"CASE WHEN {value} IS NULL THEN NULL WHEN DATALENGTH({v}) = 0 THEN '0'"
+            f" WHEN {has_surrogates} THEN {by_character} ELSE {chunks_of(v)} END"
+        )
 
 
 @attrs.define(frozen=False, init=False, kw_only=True)

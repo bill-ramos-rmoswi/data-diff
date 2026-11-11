@@ -7,14 +7,20 @@ import attrs
 from typing_extensions import Self
 
 from data_diff.utils import safezip, Vector
-from data_diff.utils import ArithString, split_space
+from data_diff.utils import ArithString, lob_digest, split_space
 from data_diff.databases.base import Database
 from data_diff.abcs.database_types import DbPath, DbKey, DbTime, IKey
 from data_diff.schema import RawColumnInfo, Schema, create_schema
 from data_diff.queries.extras import Checksum
-from data_diff.queries.api import Count, SKIP, table, this, Expr, min_, max_, Code
-from data_diff.queries.ast_classes import BinBoolOp
-from data_diff.queries.extras import ApplyFuncAndNormalizeAsString, NormalizeAsString
+from data_diff.queries.api import Count, SKIP, table, this, Expr, min_, max_, Code, and_, or_, sum_
+from data_diff.queries.ast_classes import BinBoolOp, In, Select
+from data_diff.queries.extras import (
+    ApplyFuncAndNormalizeAsString,
+    DigestNeedsClient,
+    NormalizeAsString,
+    RawForClient,
+    RowHash,
+)
 
 logger = logging.getLogger("table_segment")
 
@@ -191,6 +197,59 @@ class TableSegment:
         select = self.make_select().select(*fetched_cols)
         return self.database.query(select, List[Tuple])
 
+    def get_key_hashes(self) -> list:
+        """Download the key and a hash of each row of the segment, in one pass.
+
+        Each row is ``(*key, hash, needs_client)``. ``needs_client`` is 1 when the row has a large
+        value that the database couldn't hash, so the hash doesn't cover it.
+        """
+        checked_columns = [c for c in self.relevant_columns if c not in self.ignored_columns]
+        select = self.make_select().select(
+            *(NormalizeAsString(this[c]) for c in self.key_columns),
+            RowHash([NormalizeAsString(this[c]) for c in checked_columns]),
+            DigestNeedsClient([this[c] for c in checked_columns]),
+        )
+        return self.database.query(select, List[Tuple])
+
+    def get_rows_by_keys(self, keys: Sequence[Tuple[str, ...]]) -> List[tuple]:
+        """Download the rows with the given keys, as ``get_values`` would return them.
+
+        The keys are normalized strings, as ``get_key_hashes`` returns them. Large values that the
+        database couldn't hash are downloaded and hashed here.
+        """
+        key_types = [self._schema[k] for k in self.key_columns]
+        typed_keys = [tuple(t.make_value(v) for t, v in safezip(key_types, key)) for key in keys]
+        if len(self.key_columns) == 1:
+            has_key = In(this[self.key_columns[0]], [key[0] for key in typed_keys])
+        else:
+            has_key = or_(*(and_(*(this[c] == v for c, v in safezip(self.key_columns, key))) for key in typed_keys))
+
+        columns = self.relevant_columns
+        dialect = self.database.dialect
+        on_client = [
+            i
+            for i, c in enumerate(columns)
+            if getattr(self._schema[c], "digest", None) is not None and self._schema[c].digest.client
+        ]
+        select = self.source_table.where(
+            has_key, *self._make_update_range(), Code(self._where()) if self.where else SKIP
+        ).select(
+            *(NormalizeAsString(this[c]) for c in columns),
+            *(DigestNeedsClient([this[columns[i]]]) for i in on_client),
+            *(RawForClient(this[columns[i]]) for i in on_client),
+        )
+        rows = []
+        for row in self.database.query(select, List[Tuple]):
+            row = list(row)
+            flags = row[len(columns) : len(columns) + len(on_client)]
+            raws = row[len(columns) + len(on_client) :]
+            for needs_client, raw, i in zip(flags, raws, on_client):
+                # The flag decides, because some databases return the value for every row
+                if needs_client:
+                    row[i] = lob_digest(dialect.decode_raw(raw, self._schema[columns[i]]))
+            rows.append(tuple(row[: len(columns)]))
+        return rows
+
     def choose_checkpoints(self, count: int) -> List[List[DbKey]]:
         "Suggests a bunch of evenly-spaced checkpoints to split by, including start, end."
 
@@ -254,7 +313,13 @@ class TableSegment:
         cols = [NormalizeAsString(this[c]) for c in checked_columns]
 
         start = time.monotonic()
-        q = self.make_select().select(Count(), Checksum(cols))
+        has_digest = any(getattr(self._schema[c], "digest", None) is not None for c in checked_columns)
+        if has_digest and self.database.dialect.DIGEST_IN_SUBQUERY:
+            # The digest of a large value is a subquery, which this database can't aggregate over
+            row_hashes = self.make_select().select(row_hash=RowHash(cols))
+            q = Select(row_hashes, columns=[Count(), sum_(Code("row_hash"))])
+        else:
+            q = self.make_select().select(Count(), Checksum(cols))
         count, checksum = self.database.query(q, tuple)
         duration = time.monotonic() - start
         if duration > RECOMMENDED_CHECKSUM_DURATION:

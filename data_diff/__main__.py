@@ -18,6 +18,7 @@ from data_diff.databases._connect import connect
 from data_diff.dbt import dbt_diff
 from data_diff.diff_tables import Algorithm, TableDiffer
 from data_diff.hashdiff_tables import HashDiffer, DEFAULT_BISECTION_THRESHOLD, DEFAULT_BISECTION_FACTOR
+from data_diff.rowhash_tables import RowHashDiffer
 from data_diff.joindiff_tables import TABLE_WRITE_LIMIT, JoinDiffer
 from data_diff.parse_time import parse_time_before, UNITS_STR, ParseError
 from data_diff.queries.api import current_timestamp
@@ -405,6 +406,9 @@ def _get_table_differ(
                 materialize_to_table and db1.dialect.parse_table_name(eval_name_template(materialize_to_table))
             ),
         )
+
+    if algorithm == Algorithm.ROWHASH:
+        return RowHashDiffer(threaded=threaded, max_threadpool_size=threads and threads * 2)
 
     assert algorithm == Algorithm.HASHDIFF
     return HashDiffer(

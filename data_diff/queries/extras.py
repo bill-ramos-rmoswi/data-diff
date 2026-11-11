@@ -27,3 +27,24 @@ class ApplyFuncAndNormalizeAsString(ExprNode):
 @attrs.define(frozen=True)
 class Checksum(ExprNode):
     exprs: Sequence[Expr]
+
+
+@attrs.define(frozen=True)
+class RowHash(ExprNode):
+    """The hash of one row, which is what ``Checksum`` sums."""
+
+    exprs: Sequence[Expr]
+
+
+@attrs.define(frozen=True)
+class DigestNeedsClient(ExprNode):
+    """1 for a row with a large value that the database can't hash, which the client must fetch."""
+
+    exprs: Sequence[Expr]
+
+
+@attrs.define(frozen=True)
+class RawForClient(ExprNode):
+    """The value itself where the database can't hash it, and NULL elsewhere."""
+
+    expr: ExprNode

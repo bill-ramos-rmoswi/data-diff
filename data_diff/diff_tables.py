@@ -26,6 +26,7 @@ class Algorithm(Enum):
     AUTO = "auto"
     JOINDIFF = "joindiff"
     HASHDIFF = "hashdiff"
+    ROWHASH = "rowhash"
 
 
 DiffResult = Iterator[Tuple[str, tuple]]  # Iterator[Tuple[Literal["+", "-"], tuple]]

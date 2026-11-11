@@ -5,15 +5,21 @@ from typing import Any, ClassVar, Dict, List, Optional, Type
 import attrs
 
 from data_diff.abcs.database_types import (
+    Binary,
     Boolean,
+    ColType,
+    ColType_UUID,
     Date,
     DbPath,
     DbTime,
     Decimal,
+    DigestSource,
     Float,
     FractionalType,
     Integer,
     LongText,
+    Native_UUID,
+    StringType,
     TemporalType,
     Text,
     Time,
@@ -32,6 +38,17 @@ from data_diff.databases.base import (
     import_helper,
 )
 from data_diff.queries.ast_classes import CreateTable, TruncateTable
+from data_diff.utils import BINARY_DIGEST_CHUNK, TEXT_DIGEST_CHUNK
+
+
+# Chunks of a large value are counted with three digits in this base
+DIGEST_BASE = 32
+MAX_DIGEST_CHUNKS = DIGEST_BASE**3
+
+
+@attrs.define(frozen=True)
+class Db2Lob(Text):
+    """CLOB and DBCLOB, which HASH rejects"""
 
 
 @import_helper("db2")
@@ -65,11 +82,15 @@ class Dialect(BaseDialect):
         # Text
         "VARCHAR": Text,
         "CHARACTER": Text,
-        "CLOB": Text,
+        "CLOB": Db2Lob,
         "LONG VARCHAR": Text,
         "GRAPHIC": Text,
         "VARGRAPHIC": Text,
-        "DBCLOB": Text,
+        "DBCLOB": Db2Lob,
+        # Bytes
+        "BLOB": Binary,
+        "BINARY": Binary,
+        "VARBINARY": Binary,
         # Bool
         "BOOLEAN": Boolean,
     }
@@ -189,6 +210,10 @@ class Dialect(BaseDialect):
         return f"CASE WHEN {value} THEN '1' WHEN NOT {value} THEN '0' END"
 
     def md5_as_int(self, s: str) -> str:
+        return self._md5_tail(s, CHECKSUM_OFFSET)
+
+    def _md5_tail(self, s: str, offset: int = 0) -> str:
+        """The last 12 hex digits of the MD5 of a string or bytes, as a number, less the offset."""
         # Db2 has no function that reads hex as a number, so add up the value of each digit.
         # The LATERAL query computes the hash once per row, instead of once per digit.
         # BIGINT is required: multiplying two INTs overflows for digits that are large enough.
@@ -199,7 +224,90 @@ class Dialect(BaseDialect):
         )
         first_byte = (MD5_HEXDIGITS - CHECKSUM_HEXDIGITS) // 2 + 1
         last_bytes = f"SUBSTR(HASH({s}, 0), {first_byte}, {CHECKSUM_HEXDIGITS // 2})"
-        return f"(SELECT ({digit_values}) - {CHECKSUM_OFFSET} FROM LATERAL(VALUES (HEX({last_bytes}))) AS md5_tail(h))"
+        return f"(SELECT ({digit_values}) - {offset} FROM LATERAL(VALUES (HEX({last_bytes}))) AS md5_tail(h))"
+
+    # Large values. HASH rejects a CLOB, and takes at most 32,672 bytes, so a large value is
+    # hashed a chunk at a time.
+
+    def needs_digest(self, coltype: ColType) -> bool:
+        return isinstance(coltype, (Binary, Db2Lob))
+
+    def as_digest_type(self, coltype: ColType, source: DigestSource) -> ColType:
+        if isinstance(coltype, (StringType, ColType_UUID)) and not isinstance(coltype, Native_UUID):
+            # Whatever sampling refined the column to, the other side holds plain text
+            return Text(digest=source)
+        return super().as_digest_type(coltype, source)
+
+    def _digest_length(self, value: str, coltype: ColType) -> str:
+        return f"LENGTH({value})" if isinstance(coltype, Binary) else f"CHARACTER_LENGTH({value}, CODEUNITS32)"
+
+    def digest_needs_client(self, value: str, coltype: ColType) -> Optional[str]:
+        digest = getattr(coltype, "digest", None)
+        if digest is None or not digest.client:
+            return None
+        n = BINARY_DIGEST_CHUNK if isinstance(coltype, Binary) else TEXT_DIGEST_CHUNK
+        return f"{self._digest_length(value, coltype)} > {MAX_DIGEST_CHUNKS * n}"
+
+    def normalize_digest(self, value: str, coltype: ColType) -> str:
+        length = self._digest_length(value, coltype)
+        is_binary = isinstance(coltype, Binary)
+        n = BINARY_DIGEST_CHUNK if is_binary else TEXT_DIGEST_CHUNK
+        start = f"k.i * {n} + 1"
+
+        if is_binary:
+            one_chunk = f"BX'{b'0|'.hex()}' || CAST(SUBSTRING({value}, 1, {n}, OCTETS) AS VARBINARY({n}))"
+            lengths = f"LENGTH({value}), LENGTH({value})"
+            chunk = (
+                f"CAST(VARCHAR(k.i) || '|' AS VARBINARY(13))"
+                f" || CAST(SUBSTRING({value}, {start}, {n}, OCTETS) AS VARBINARY({n}))"
+            )
+        else:
+            # A character takes up to 4 bytes. A cast that would truncate fails, even in a branch
+            # of a CASE that isn't taken, so the first chunk is cut like the others.
+            one_chunk = f"'0|' || CAST(SUBSTRING({value}, 1, {n}, CODEUNITS32) AS VARCHAR({4 * n}))"
+            lengths = f"LENGTH({value}, OCTETS), {length}"
+            # Finding a character in a CLOB reads it from the start, which takes about 4 seconds
+            # for each MB. ASCII text has one byte for each character, and cutting bytes takes
+            # 0.6 seconds for each MB. Cutting bytes pads the last chunk, unless its length is given.
+            # Db2 may evaluate it for a number past the end, where the length must still be valid.
+            by_byte = f"SUBSTRING({value}, {start}, MAX(1, MIN({n}, l.octets - k.i * {n})), OCTETS)"
+            by_character = f"SUBSTRING({value}, {start}, {n}, CODEUNITS32)"
+            chunk = (
+                f"VARCHAR(k.i) || '|' || CASE WHEN l.octets = l.len THEN CAST({by_byte} AS VARCHAR({4 * n}))"
+                f" ELSE CAST({by_character} AS VARCHAR({4 * n})) END"
+            )
+
+        # Db2 has no series of numbers, so three digits in base 32 count the chunks. The first
+        # digit is limited by the length, so a value of a few chunks doesn't count to 32,768.
+        digit = "TABLE(VALUES " + ", ".join(f"({i})" for i in range(DIGEST_BASE)) + ")"
+        last = f"(l.len - 1) / {n}"
+        numbers = (
+            f"LATERAL(SELECT a.n * {DIGEST_BASE ** 2} + b.n * {DIGEST_BASE} + c.n AS i"
+            f" FROM {digit} AS a(n), {digit} AS b(n), {digit} AS c(n)"
+            f" WHERE a.n <= {last} / {DIGEST_BASE ** 2})"
+        )
+        # The sum is over a derived table, because an aggregate can't mix an outer column with k.i.
+        # LATERAL lets a derived table read a column of the outer query, and the lengths are in
+        # their own, so that they're computed once for the value instead of once for each number.
+        chunks = (
+            f"(SELECT SUM(x.term) FROM LATERAL(VALUES ({lengths})) AS l(octets, len),"
+            f" LATERAL(SELECT {self._md5_tail(chunk)} AS term FROM {numbers} AS k WHERE k.i <= {last}) AS x)"
+        )
+
+        if coltype.digest.client:
+            too_long = "CAST(NULL AS VARCHAR(30))"
+        else:
+            message = (
+                f"data-diff: a value over {MAX_DIGEST_CHUNKS * n} {'bytes' if is_binary else 'characters'}"
+                " can not be hashed on Db2, so compare this table with the rowhash algorithm"
+            )
+            too_long = f"RAISE_ERROR('70001', '{message}')"
+        return (
+            f"CASE WHEN {value} IS NULL THEN NULL WHEN LENGTH({value}) = 0 THEN '0'"
+            f" WHEN {length} <= {n} THEN VARCHAR({self._md5_tail(one_chunk)})"
+            f" WHEN {length} <= {MAX_DIGEST_CHUNKS * n} THEN VARCHAR({chunks})"
+            f" ELSE {too_long} END"
+        )
 
     def md5_as_hex(self, s: str) -> str:
         return f"LOWER(HEX(HASH({s}, 0)))"
@@ -264,6 +372,17 @@ class Db2(ThreadedDatabase):
             f"WHERE TABSCHEMA = '{schema}' AND TABNAME = '{name}' "
             "ORDER BY COLNO"
         )
+
+    def _refine_coltypes(
+        self, table_path: DbPath, col_dict: Dict[str, ColType], where: Optional[str] = None, sample_size=64
+    ):
+        # A CLOB can't be a key, and sampling one over 32,672 bytes fails, so they aren't sampled
+        lobs = {k: v for k, v in col_dict.items() if isinstance(v, Db2Lob)}
+        for name in lobs:
+            del col_dict[name]
+        super()._refine_coltypes(table_path, col_dict, where, sample_size)
+        col_dict.update(lobs)
+        return col_dict
 
     def _query_cursor(self, c, sql_code: str):
         # ibm_db cuts one character off the end of a statement for each character outside the

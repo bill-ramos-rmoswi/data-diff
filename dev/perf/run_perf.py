@@ -4,6 +4,8 @@ Run this in the devcontainer, after dev/perf/seed.py:
 
     poetry run python dev/perf/run_perf.py fact_2x fact_13x
 
+PERF_ALGORITHM=rowhash times the algorithm that reads each table once, instead of hashdiff.
+
 Each pair runs three scenarios, which change the target table and then restore it: identical
 tables, updated rows, and deleted rows. A run fails if data-diff doesn't report exactly the rows
 that were changed. Results go to benchmark_<revision>.jsonl, which dev/graph.py can chart.
@@ -39,6 +41,8 @@ if os.environ.get("DATADIFF_SYBASE_URI"):
 if os.environ.get("PERF_PAIRS"):
     # For example PERF_PAIRS=Sybase:PostgreSQL,PostgreSQL:Sybase
     PAIRS = [tuple(pair.split(":")) for pair in os.environ["PERF_PAIRS"].split(",")]
+# hashdiff checksums segments and bisects those that differ. rowhash reads each table once.
+ALGORITHM = os.environ.get("PERF_ALGORITHM", "hashdiff")
 # Describes the ASE server for the results, such as "2g image defaults"
 SYBASE_CONFIG = os.environ.get("SYBASE_CONFIG", "")
 
@@ -81,7 +85,7 @@ def run_diff(source: str, target: str, table: str):
         for db_name in (source, target)
     ]
     start = time.monotonic()
-    diff = list(diff_tables(*tables))
+    diff = list(diff_tables(*tables, algorithm=ALGORITHM))
     duration = time.monotonic() - start
     for segment in tables:
         segment.database.close()
@@ -105,9 +109,12 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
     keys = changed_keys(conn, table_sql)
 
     def record(scenario: str, duration: float, lines: int):
-        print(f"{source:>10} -> {target:<10} {table:<9} {scenario:<9} {duration:8.1f}s  {lines} lines", flush=True)
+        print(
+            f"{source:>10} -> {target:<10} {table:<9} {ALGORITHM:<8} {scenario:<9} {duration:8.1f}s  {lines} lines",
+            flush=True,
+        )
         result = {
-            "test": f"perf_{source}_{target}_{scenario}".lower(),
+            "test": f"perf_{source}_{target}_{scenario}{'' if ALGORITHM == 'hashdiff' else '_' + ALGORITHM}".lower(),
             "source_db": source,
             "target_db": target,
             "date": str(datetime.today()),
@@ -124,6 +131,7 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
             "download_sec": 0,
             "changed_rows": len(keys) if scenario != "identical" else 0,
             "threads": THREADS,
+            "algorithm": ALGORITHM,
         }
         if "Sybase" in (source, target):
             result["sybase_config"] = SYBASE_CONFIG
