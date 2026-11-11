@@ -9,7 +9,14 @@ services:
     command: sleep infinity
     volumes:
       - .:/workspaces/data-diff:cached
-      - claude-config:/home/vscode/.claude
+      # Claude Code's sessions, plans and login, kept in WSL rather than a Docker volume. It's a separate
+      # directory from the WSL ~/.claude, whose plugin records hold WSL paths. Both directories are
+      # created by `initializeCommand` in devcontainer.json, and stay empty for someone who doesn't use
+      # Claude Code or gh.
+      - ${HOME:?run docker compose from WSL, where HOME is set}/.claude-devcontainer:/home/vscode/.claude
+      # Shares the WSL `gh auth login`, so it survives a rebuild. Git's name and email need nothing
+      # here, because VS Code copies the WSL ~/.gitconfig into the container.
+      - ${HOME:?run docker compose from WSL, where HOME is set}/.config/gh:/home/vscode/.config/gh
     environment:
       CLAUDE_CONFIG_DIR: /home/vscode/.claude
       # Compose service names, not localhost. SQL Server uses its container port here.
@@ -22,6 +29,3 @@ services:
       DATADIFF_SYBASE_URI: sybase://sa:Password1@ase:5000/testdb/dbo
     networks:
       - local
-
-volumes:
-  claude-config:

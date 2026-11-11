@@ -206,6 +206,51 @@ These pre-deployment checks were skipped and **haven't been done**. Read-only ac
 - [ ] Confirm SQL Server is 2022 or later if binary or large text columns are compared.
 - [ ] Test the column types of the first tables you compare on the local containers.
 
+## Working in the devcontainer
+
+The devcontainer has Python, Poetry, the ODBC drivers, `gh` and Claude Code. Open it from the WSL clone in VS Code with **Dev Containers: Reopen in Container**. The container has no Docker socket, so the `docker` commands below run in a WSL terminal.
+
+### Once per machine
+
+In WSL:
+
+```shell
+gh auth login
+git config --global user.name "<your name>"
+git config --global user.email "$(gh api user -q '"\(.id)+\(.login)@users.noreply.github.com"')"
+docker login ghcr.io    # a token with read:packages, for the SAP ASE image
+```
+
+The email is your GitHub noreply address, which keeps your own address out of public commits. To have GitHub enforce that, turn on **Block command line pushes that expose my email** in your GitHub email settings.
+
+VS Code copies the WSL `~/.gitconfig` into the container. The container mounts `~/.config/gh`, so it shares the WSL `gh` login, and `~/.claude-devcontainer`, which holds Claude Code's sessions and login. All three survive a rebuild. The devcontainer creates both directories in WSL before it starts, and they stay empty if you don't use gh or Claude Code. Changes to the mounts in `.devcontainer/` need **Dev Containers: Rebuild Container**, not just a reload.
+
+### At the start of a session
+
+Run `/hello` in Claude Code. It checks your git name and email, your gh login, each database, and any work left over from the last session. It sets your noreply email for the session if the email is wrong, and asks before anything else. Without Claude Code:
+
+1. Reopen in the container. PostgreSQL, MySQL, SQL Server and Db2 start with it. Db2 takes a minute or more when its volume is new.
+2. Check `git config user.email` and `gh auth status`.
+3. If you'll test SAP ASE, start it from WSL: `docker compose --profile ase up -d --wait ase`. Otherwise unset `DATADIFF_SYBASE_URI` in the container terminal, or the tests stop at import.
+4. Check the `Testing databases:` line of a test run, such as `poetry run python -m unittest tests.test_query`. A database that isn't listed is skipped silently.
+5. Check `git status` and `git stash list` for work left from last time.
+
+`claude --continue` reopens the last Claude Code session, and `claude --resume` lists earlier ones.
+
+### At the end of a session
+
+Run `/shutting-down` in Claude Code. It reports uncommitted or unpushed work, stashes, open PRs and failed CI runs, and background jobs still running. Then it gives you a short handoff and asks whether to stop the databases. It doesn't commit, push or stop anything without asking. Without Claude Code, check `git status`, `git log @{upstream}..HEAD` and `git stash list`.
+
+The databases keep running when VS Code closes. To stop them and keep their data, run this in WSL:
+
+```shell
+docker compose --profile ase stop
+```
+
+`docker compose down -v` deletes every database volume, including ASE's devices and the perf tables, so only use it to start over.
+
+Sessions are files under `~/.claude-devcontainer/projects/-workspaces-data-diff/` in WSL. Claude Code files them by working directory, so a session from the container doesn't appear in `claude --resume` run in WSL.
+
 ## Contributors
 
 <a href="https://github.com/datafold/data-diff/graphs/contributors">
