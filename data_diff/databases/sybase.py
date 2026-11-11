@@ -143,6 +143,13 @@ class SybaseFloat(Float):
     significant_digits: int = attrs.field(default=15, kw_only=True)
 
 
+@attrs.define(frozen=True)
+class SybaseDecimal(Decimal):
+    # The declared scale of numeric and decimal, or None for money and smallmoney, which convert
+    # to varchar with 2 decimals. It has no storage field, because that would make it text.
+    scale: Optional[int] = attrs.field(default=None, kw_only=True)
+
+
 def _storage(coltype: Optional[ColType]) -> Optional[str]:
     return getattr(coltype, "storage", None)
 
@@ -287,7 +294,10 @@ class Dialect(BaseDialect):
         if cls is Decimal and info.numeric_scale == 0 and info.data_type in ("numeric", "decimal"):
             # Identity columns are numeric(n, 0), and only integers can be keys
             return Integer()
-        return super().parse_type(table_path, info)
+        coltype = super().parse_type(table_path, info)
+        if cls is Decimal and info.data_type in ("numeric", "decimal"):
+            return SybaseDecimal(precision=coltype.precision, scale=info.numeric_scale)
+        return coltype
 
     def _convert_db_precision_to_digits(self, p: int) -> int:
         # Same reduction as PostgreSQL, so a real and a float holding the same number compare equal
@@ -517,6 +527,9 @@ class Dialect(BaseDialect):
         precision = coltype.precision
         if isinstance(coltype, Float):
             return self._normalize_float(value, coltype)
+        if getattr(coltype, "scale", None) == precision:
+            # numeric or decimal with the decimals compared, which converting to varchar shows
+            return f"convert(varchar(50), {value})"
         # Casts truncate, so round first. money converts to numeric with all 4 of its decimals.
         return f"convert(varchar(50), convert(numeric(38, {precision}), round({value}, {precision})))"
 
