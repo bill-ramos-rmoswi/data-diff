@@ -51,6 +51,19 @@ class Db2Lob(Text):
     """CLOB and DBCLOB, which HASH rejects"""
 
 
+def _decimal_digits_as_hex(n: str) -> str:
+    """SQL for the number whose hex digits are the decimal digits of n, which has at most
+    CHECKSUM_HEXDIGITS digits: 123 gives 0x123 = 291.
+
+    Digit k of n (from 0, counting from the right) counts 10^k in n, and should count 16^k.
+    n / 10^k, with integer division, holds digit k in its units and higher digits above them,
+    and adding (n / 10^k) * 6 * 16^(k-1) for k = 1 to 11 adds the difference for every digit.
+    The largest term is under 2^48, so BIGINT can't overflow.
+    """
+    terms = [n] + [f"{n} / {10**k} * {6 * 16 ** (k - 1)}" for k in range(1, CHECKSUM_HEXDIGITS)]
+    return " + ".join(terms)
+
+
 @import_helper("db2")
 def import_db2():
     import ibm_db_dbi
@@ -214,17 +227,23 @@ class Dialect(BaseDialect):
 
     def _md5_tail(self, s: str, offset: int = 0) -> str:
         """The last 12 hex digits of the MD5 of a string or bytes, as a number, less the offset."""
-        # Db2 has no function that reads hex as a number, so add up the value of each digit.
-        # The LATERAL query computes the hash once per row, instead of once per digit.
-        # BIGINT is required: multiplying two INTs overflows for digits that are large enough.
-        hex_digits = "'0123456789ABCDEF'"
-        digit_values = " + ".join(
-            f"BIGINT(LOCATE(SUBSTR(h, {i + 1}, 1), {hex_digits}) - 1) * {16 ** (CHECKSUM_HEXDIGITS - i - 1)}"
-            for i in range(CHECKSUM_HEXDIGITS)
-        )
+        # Db2 has no function that reads hex as a number. TRANSLATE turns each hex digit into two
+        # decimal digits, the value mod 10 (A-F become 0-5) and the value div 10 (0 or 1), and
+        # BIGINT reads each string as a decimal number. _decimal_digits_as_hex() then gives each
+        # digit its hex weight. That's 4 function calls, against 24 for reading each digit alone.
+        # Both derived tables must be VALUES: Db2 inlines LATERAL(SELECT ...), which would compute
+        # HASH again for each reference. VALUES computes it once per row.
         first_byte = (MD5_HEXDIGITS - CHECKSUM_HEXDIGITS) // 2 + 1
         last_bytes = f"SUBSTR(HASH({s}, 0), {first_byte}, {CHECKSUM_HEXDIGITS // 2})"
-        return f"(SELECT ({digit_values}) - {offset} FROM LATERAL(VALUES (HEX({last_bytes}))) AS md5_tail(h))"
+        hex_digits = "'0123456789ABCDEF'"
+        ones = f"BIGINT(TRANSLATE(md5_tail.h, '0123456789012345', {hex_digits}))"
+        tens = f"BIGINT(TRANSLATE(md5_tail.h, '0000000000111111', {hex_digits}))"
+        value = f"{_decimal_digits_as_hex('md5_digits.ones')} + 10 * ({_decimal_digits_as_hex('md5_digits.tens')})"
+        return (
+            f"(SELECT {value} - {offset}"
+            f" FROM LATERAL(VALUES (HEX({last_bytes}))) AS md5_tail(h),"
+            f" LATERAL(VALUES ({ones}, {tens})) AS md5_digits(ones, tens))"
+        )
 
     # Large values. HASH rejects a CLOB, and takes at most 32,672 bytes, so a large value is
     # hashed a chunk at a time.
