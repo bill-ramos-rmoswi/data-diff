@@ -38,6 +38,7 @@ from data_diff.databases.base import (
     import_helper,
 )
 from data_diff.queries.ast_classes import CreateTable, TruncateTable
+from data_diff.schema import RawColumnInfo
 from data_diff.queries.extras import Checksum, RowHash
 from data_diff.utils import BINARY_DIGEST_CHUNK, TEXT_DIGEST_CHUNK, join_iter
 
@@ -50,6 +51,14 @@ MAX_DIGEST_CHUNKS = DIGEST_BASE**3
 @attrs.define(frozen=True)
 class Db2Lob(Text):
     """CLOB and DBCLOB, which HASH rejects"""
+
+
+@attrs.define(frozen=True)
+class Db2Decimal(Decimal):
+    """DECIMAL, with its declared scale. precision is the scale compared, which may be lower if
+    the other side has fewer decimals. attrs.evolve() keeps the subclass and the scale."""
+
+    scale: Optional[int] = attrs.field(default=None, kw_only=True)
 
 
 def _decimal_digits_as_hex(n: str) -> str:
@@ -111,6 +120,12 @@ class Dialect(BaseDialect):
 
     def quote(self, s: str) -> str:
         return f'"{s}"'
+
+    def parse_type(self, table_path: DbPath, info: RawColumnInfo) -> ColType:
+        coltype = super().parse_type(table_path, info)
+        if type(coltype) is Decimal:
+            return Db2Decimal(precision=coltype.precision, scale=info.numeric_scale)
+        return coltype
 
     def _convert_db_precision_to_digits(self, p: int) -> int:
         # Same reduction as PostgreSQL, so that REAL and DOUBLE compare equal
@@ -224,8 +239,12 @@ class Dialect(BaseDialect):
             # VARCHAR_FORMAT renders a value that doesn't fit as #####, and those would all hash the same
             return f"CASE WHEN ABS({number}) < 1E{whole_digits} THEN {fixed} ELSE VARCHAR(NORMALIZE_DECFLOAT({number})) END"
 
-        # ROUND because casting to DECIMAL also truncates. 31 is the most digits a DECIMAL can have.
-        number = f"VARCHAR(CAST(ROUND({value}, {precision}) AS DECIMAL(31, {precision})))"
+        if getattr(coltype, "scale", None) == precision:
+            # The column already has the decimals compared, which VARCHAR shows
+            number = f"VARCHAR({value})"
+        else:
+            # ROUND because casting to DECIMAL also truncates. 31 is the most digits a DECIMAL can have.
+            number = f"VARCHAR(CAST(ROUND({value}, {precision}) AS DECIMAL(31, {precision})))"
 
         # VARCHAR omits the leading zero of a decimal, as in .32 and -.32
         return f"REPLACE(REPLACE(REPLACE('#' || {number}, '#.', '0.'), '#-.', '-0.'), '#', '')"
