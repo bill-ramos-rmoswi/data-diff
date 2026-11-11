@@ -50,7 +50,10 @@ jobs:
       - name: Install Poetry
         run: pipx install "poetry==$POETRY_VERSION"
       - name: Install system libraries
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev unixodbc-dev
+        # The runners' Azure Ubuntu mirror stopped resolving on 2026-11-11, and apt doesn't fall back
+        run: |
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/' /etc/apt/apt-mirrors.txt
+          sudo apt-get update && sudo apt-get install -y libpq-dev unixodbc-dev
       - name: Install dependencies
         run: poetry install
       - name: Run tests
@@ -81,6 +84,7 @@ jobs:
             | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/' /etc/apt/apt-mirrors.txt
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 libpq-dev unixodbc-dev
       - name: Install Poetry
@@ -134,6 +138,7 @@ jobs:
             | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/' /etc/apt/apt-mirrors.txt
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 libpq-dev unixodbc-dev tdsodbc freetds-bin
           odbcinst -q -d
