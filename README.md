@@ -223,7 +223,7 @@ docker login ghcr.io    # a token with read:packages, for the SAP ASE image
 
 The email is your GitHub noreply address, which keeps your own address out of public commits. To have GitHub enforce that, turn on **Block command line pushes that expose my email** in your GitHub email settings.
 
-VS Code copies the WSL `~/.gitconfig` into the container. The container mounts `~/.config/gh`, so it shares the WSL `gh` login, and `~/.claude-devcontainer`, which holds Claude Code's sessions and login. All three survive a rebuild. The devcontainer creates both directories in WSL before it starts, and they stay empty if you don't use gh or Claude Code. Changes to the mounts in `.devcontainer/` need **Dev Containers: Rebuild Container**, not just a reload.
+VS Code copies the WSL `~/.gitconfig` into the container. The container mounts `~/.config/gh`, so it shares the WSL `gh` login, and `~/.claude-devcontainer`, which holds Claude Code's sessions and login. All three survive a rebuild. The devcontainer creates both directories in WSL before it starts, and they stay empty if you don't use gh or Claude Code. Changes to the mounts in `.devcontainer/` need **Dev Containers: Rebuild Container**, not just a reload. `.devcontainer/devcontainer-lock.json` pins the versions of the devcontainer features, so every rebuild gets the same ones, and Dependabot proposes updates to it weekly. VS Code rewrites it when the features in `devcontainer.json` change, so commit the two together.
 
 ### At the start of a session
 

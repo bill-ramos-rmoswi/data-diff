@@ -1,0 +1,7 @@
+# Proposes updates to the feature versions pinned in .devcontainer/devcontainer-lock.json.
+version: 2
+updates:
+  - package-ecosystem: devcontainers
+    directory: /
+    schedule:
+      interval: weekly

@@ -22,7 +22,8 @@ git stash list
 git branch -vv | grep ': gone]'
 ```
 
-- Uncommitted or untracked changes: list them. Ignore `.devcontainer/devcontainer-lock.json` unless the user has decided to commit it.
+- Uncommitted or untracked changes: list them.
+- If `.devcontainer/devcontainer-lock.json` is modified, VS Code rewrote it after a feature change or a rebuild. Show its diff, and suggest committing it with the `devcontainer.json` change that caused it, or on its own if the features only moved to newer versions.
 - Commits that aren't pushed, or a branch with no upstream: say so. They exist only on this machine.
 - Stashes: list them, because they're easy to forget.
 - Branches whose upstream is gone: their PR was merged or closed, and they can be deleted.
