@@ -133,6 +133,24 @@ Other differences to know:
 - SQL text is sent in cp850, so data-diff writes other characters as `U&''` escapes. FreeTDS returns `unitext` as UTF-16LE bytes, so joindiff's materialized tables, which use `unitext`, read back as bytes through pyodbc.
 - A read-only login needs only `SELECT` on the compared tables.
 
+## Performance against PostgreSQL
+
+These timings simulate comparing an on-premises database with Aurora PostgreSQL, using PostgreSQL 18.6 in place of Aurora. Each source table is compared with a PostgreSQL copy holding the same rows. The tables are `FactProductInventory` from Microsoft's AdventureWorksDW2022, enlarged by `dev/perf/seed.py`, with a three-column integer key and five compared columns.
+
+Times are in seconds, for a whole `diff_tables()` call with 4 threads per database:
+
+| Source → PostgreSQL | `fact_2x`, 1.55M rows: identical / updated / deleted | `fact_13x`, 10.09M rows: identical / updated / deleted |
+| --- | --- | --- |
+| SAP ASE 16.1 | 3.5 / 6.7 / 6.7 | 21.8 / 45.2 / 45.7 |
+| Db2 12.1 | 4.4 / 11.8 / 13.1 | 33.1 / 65.8 / 63.5 |
+| SQL Server 2025 | 21.3 / 29.4 / 29.4 | 33.1 / 76.4 / 78.2 |
+
+- **identical**: the tables match.
+- **updated**: `UnitCost` changed on about 0.016% of the PostgreSQL rows (242 in `fact_2x`, 1,573 in `fact_13x`), spread across the table.
+- **deleted**: the same rows deleted from PostgreSQL.
+
+Every run reported exactly the rows that were changed. All four databases ran in containers on one workstation (16 cores, 24 GB), with SAP ASE at its 2 GB defaults (1.5 GB max memory, 768 MB data cache) and Db2 Community Edition limited to 4 cores. These numbers compare sources with each other, rather than predict production times: a real run also depends on the network between the host running data-diff and each database, and on Aurora's instance size. Times vary by about 20% from one run to the next.
+
 ## TODO: check the target environment
 
 These pre-deployment checks were skipped and **haven't been done**. Read-only accounts were tested on local containers, but nothing below has been confirmed on a real target.
