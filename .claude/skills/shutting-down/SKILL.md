@@ -44,6 +44,7 @@ Report open PRs with failing or running checks, and any workflow run in progress
 
 - Background tasks you started (test runs, watches, `run_perf.py`): list any still running, and ask whether to stop them or let them finish.
 - Anything learned this session that isn't in the repo or CLAUDE.md and would be needed next time: offer to save it as a memory. Don't save what git history already records.
+- Write the handoff as a project memory named `handoff`, replacing the previous one. Its body has what was done, what's in progress (branch, PR, background jobs), the next step as a prompt the user can paste (for example `/perf ...` or the next phase of a one-shot prompt), and the model that step needs. `/hello` reads it, so the next session doesn't start from pasted output. Do this without asking, because it changes nothing in the repo.
 - Finish with a handoff of at most five lines: what was done, what's in progress, and the next step. The session is saved in WSL at `~/.claude-devcontainer` (or `~/.claude` in WSL), so `claude --continue` reopens it.
 
 ## 5. Databases
