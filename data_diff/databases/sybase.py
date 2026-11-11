@@ -24,12 +24,14 @@ from typing import Any, ClassVar, Dict, List, Optional, Type
 import attrs
 
 from data_diff.abcs.database_types import (
+    Binary,
     Boolean,
     ColType,
     Date,
     DbPath,
     DbTime,
     Decimal,
+    DigestSource,
     Float,
     FractionalType,
     Integer,
@@ -54,8 +56,9 @@ from data_diff.databases.base import (
     import_helper,
 )
 from data_diff.queries.ast_classes import ConstantTable, CreateTable, DropTable, InsertToTable
-from data_diff.queries.extras import Checksum, NormalizeAsString
+from data_diff.queries.extras import Checksum, NormalizeAsString, RawForClient
 from data_diff.schema import RawColumnInfo
+from data_diff.utils import BINARY_DIGEST_CHUNK, DIGEST_HEXDIGITS, TEXT_DIGEST_CHUNK
 
 logger = logging.getLogger("sybase")
 
@@ -71,9 +74,16 @@ CP850_CHUNK = 2730
 MAX_UNICODE_HASH_UNITS = 255
 MAX_UNITEXT_HASH_UNITS = 128
 
+# A large value is read in chunks through a LOB locator, one chunk for each number in
+# master..spt_values, which has 0 to 1024. Reading a chunk takes longer the further into the value
+# it is (1 MB of text takes 0.06 s, and 20 MB takes 81 s), so longer values are left to the client.
+MAX_DIGEST_CHUNKS = 1025
+
 UNICODE_STORAGE = ("univarchar", "unichar", "unitext")
 PADDED_STORAGE = ("char", "nchar", "unichar")
 LOB_STORAGE = ("text", "unitext")
+# Storage that only a locator can read past 16384 bytes
+LOCATOR_STORAGE = {"text": "text_locator", "image": "image_locator"}
 # Storage that holds 1/300 second ticks, which ASE reports as truncated milliseconds
 TICK_STORAGE = ("datetime", "time")
 
@@ -110,6 +120,11 @@ class SybaseStringUUID(String_UUID):
 class SybaseAlphanum(String_VaryingAlphanum):
     storage: str = attrs.field(default="varchar", kw_only=True)
     length: Optional[int] = attrs.field(default=None, kw_only=True)
+
+
+@attrs.define(frozen=True)
+class SybaseBinary(Binary):
+    storage: str = attrs.field(default="varbinary", kw_only=True)
 
 
 @attrs.define(frozen=True)
@@ -239,6 +254,10 @@ class Dialect(BaseDialect):
         "univarchar": SybaseText,
         "unichar": SybaseText,
         "unitext": SybaseText,
+        # Bytes. timestamp is a row version, which a copy of the row doesn't keep.
+        "binary": SybaseBinary,
+        "varbinary": SybaseBinary,
+        "image": SybaseBinary,
         # Bool
         "bit": Boolean,
     }
@@ -253,6 +272,8 @@ class Dialect(BaseDialect):
         if cls is SybaseText:
             # numeric_precision holds the length in characters, see select_table_schema()
             return SybaseText(storage=info.data_type, length=info.numeric_precision)
+        if cls is SybaseBinary:
+            return SybaseBinary(storage=info.data_type)
         if cls in (SybaseTimestamp, SybaseTime):
             # ASE shows and converts datetime and time ticks by truncating: tick 299 is .996667, and
             # ASE says .996, so that's what a copy made through ASE holds.
@@ -434,6 +455,8 @@ class Dialect(BaseDialect):
         return value
 
     def normalize_value_by_type(self, value: str, coltype: ColType) -> str:
+        if getattr(coltype, "digest", None) is not None:
+            return self.normalize_digest(value, coltype)
         if _storage(coltype) in UNICODE_STORAGE + PADDED_STORAGE + LOB_STORAGE or isinstance(coltype, SybaseText):
             text = self._normalize_text(value, coltype)
             if isinstance(coltype, String_UUID):
@@ -528,6 +551,9 @@ class Dialect(BaseDialect):
     def _utf8(self, normalized: str, coltype: Optional[ColType], raw: Optional[str] = None) -> str:
         """The UTF-8 bytes of a normalized value, as varbinary. NULL stays NULL."""
         storage = _storage(coltype)
+        if getattr(coltype, "digest", None) is not None:
+            # A digest is a number
+            storage = None
         if storage in UNICODE_STORAGE:
             return self._unicode_utf8(normalized, coltype, raw if storage == "unitext" else None)
         if storage is not None and not isinstance(coltype, TemporalType):
@@ -572,16 +598,21 @@ class Dialect(BaseDialect):
         # Most Unicode text also fits in cp850, which has a path without a length limit. Converting
         # to varchar replaces other characters with '?', so the value must convert back unchanged.
         # = ignores trailing spaces, and the lengths don't.
+        as_cp850, fits_cp850, cp850_type = self._as_cp850(u, length)
+        return f"case when {fits_cp850} then {self._cp850_utf8(as_cp850, cp850_type)} else {converted} end"
+
+    def _as_cp850(self, u: str, length: int):
+        """Unicode text as cp850, the condition that tells whether it converted without loss,
+        and the type of the result."""
         cp850_bytes = min(length, MAX_EXPRESSION_BYTES // 2)
         as_cp850 = f"convert(varchar({cp850_bytes}), {u})"
         fits_cp850 = (
             f"convert(univarchar({cp850_bytes}), {as_cp850}) = {u}"
             f" and datalength(convert(univarchar({cp850_bytes}), {as_cp850})) = datalength({u})"
         )
-        cp850_type = SybaseText(storage="varchar", length=cp850_bytes)
-        return f"case when {fits_cp850} then {self._cp850_utf8(as_cp850, cp850_type)} else {converted} end"
+        return as_cp850, fits_cp850, SybaseText(storage="varchar", length=cp850_bytes)
 
-    def render_checksum(self, c: Compiler, elem: Checksum) -> str:
+    def render_rowhash(self, c: Compiler, elem: Checksum) -> str:
         pieces = []
         text_lengths = []
         text_pieces = []
@@ -592,13 +623,18 @@ class Dialect(BaseDialect):
             normalized = self.compile(c, expr)
             raw = self.compile(c, expr.expr) if isinstance(expr, NormalizeAsString) else None
             piece = self._utf8(normalized, coltype, raw)
-            if _storage(coltype) is not None and not isinstance(coltype, TemporalType):
+            is_text = (
+                _storage(coltype) is not None
+                and not isinstance(coltype, TemporalType)
+                and getattr(coltype, "digest", None) is None
+            )
+            if is_text:
                 # UTF-8 takes up to 3 bytes for each cp850 byte, or for each UTF-16 code unit
                 factor = 2 if _storage(coltype) in UNICODE_STORAGE else 3
                 text_lengths.append(f"isnull(datalength({normalized}), 0) * {factor}")
                 length = getattr(coltype, "length", None)
                 declared_bound = None if length is None or declared_bound is None else declared_bound + 3 * length
-            text_pieces.append(_storage(coltype) is not None and not isinstance(coltype, TemporalType))
+            text_pieces.append(is_text)
             if declared_bound is not None:
                 declared_bound += 64
             pieces.append(piece)
@@ -633,7 +669,187 @@ class Dialect(BaseDialect):
                 f"case when {upper_bound} < {MAX_EXPRESSION_BYTES} or datalength({joined}) < {MAX_EXPRESSION_BYTES}"
                 f" then {checksum} else convert(bigint, {too_long}) end"
             )
-        return f"sum({checksum})"
+        return checksum
+
+    # Large values, compared by digest
+
+    def needs_digest(self, coltype: ColType) -> bool:
+        return isinstance(coltype, Binary) or _storage(coltype) in LOB_STORAGE
+
+    def as_digest_type(self, coltype: ColType, source: DigestSource) -> ColType:
+        storage = _storage(coltype)
+        if isinstance(coltype, SybaseBinary):
+            return attrs.evolve(coltype, digest=source)
+        if storage is not None and isinstance(coltype, (SybaseText, SybaseStringUUID, SybaseAlphanum)):
+            length = coltype.length
+            if storage in UNICODE_STORAGE and storage != "unitext" and (length or 0) > TEXT_DIGEST_CHUNK:
+                raise NotImplementedError(
+                    f"Sybase ASE can't compare a {storage}({length}) column with a large value. "
+                    f"Columns of up to {TEXT_DIGEST_CHUNK} characters can be."
+                )
+            # Whatever sampling refined the column to, the other side holds plain text
+            return SybaseText(storage=storage, length=length, digest=source)
+        return super().as_digest_type(coltype, source)
+
+    @staticmethod
+    def _digest_term(index: str, chunk: str) -> str:
+        return f"hextobigint(right(hash({index} + {chunk}, 'md5'), {DIGEST_HEXDIGITS}))"
+
+    @staticmethod
+    def _digest_index(i: int) -> str:
+        return "0x" + f"{i}|".encode("ascii").hex()
+
+    @staticmethod
+    def _padded(chunk: str, length: str) -> str:
+        """A varchar chunk with the trailing spaces that converting it dropped. A chunk of only
+        spaces converts to one space."""
+        chunk = f"isnull({chunk}, ' ')"
+        return f"{chunk} + replicate(' ', {length} - datalength({chunk}))"
+
+    def _digest_limit(self, coltype: ColType) -> Optional[int]:
+        """The longest value the server hashes, in characters or bytes. None when the type itself
+        is short enough."""
+        storage = _storage(coltype)
+        if storage == "text":
+            return MAX_DIGEST_CHUNKS * TEXT_DIGEST_CHUNK
+        if storage == "image":
+            return MAX_DIGEST_CHUNKS * BINARY_DIGEST_CHUNK
+        if storage == "unitext":
+            return TEXT_DIGEST_CHUNK
+        return None
+
+    def _unitext_left_to_client(self, value: str, coltype: ColType) -> str:
+        """1 for a unitext value the server can't hash: one over a chunk, or one with characters
+        outside cp850 that's over the limit of the conversion to UTF-8."""
+        plain = SybaseText(storage="unitext")
+        _, fits_cp850, _ = self._as_cp850(self._normalize_text(value, plain), TEXT_DIGEST_CHUNK)
+        return (
+            f"case when char_length({value}) > {TEXT_DIGEST_CHUNK} then 1 when {fits_cp850} then 0"
+            f" when char_length({value}) > {MAX_UNITEXT_HASH_UNITS} then 1 else 0 end"
+        )
+
+    def digest_needs_client(self, value: str, coltype: ColType) -> Optional[str]:
+        digest = getattr(coltype, "digest", None)
+        limit = self._digest_limit(coltype)
+        if digest is None or not digest.client or limit is None:
+            return None
+        storage = _storage(coltype)
+        if storage == "unitext":
+            return f"({self._unitext_left_to_client(value, coltype)}) = 1"
+        length = "datalength" if storage == "image" else "char_length"
+        return f"{length}({value}) > {limit}"
+
+    def render_rawforclient(self, c: Compiler, elem: RawForClient) -> str:
+        # A CASE over a text or image column returns an empty value where it should return the
+        # value or NULL, so the column is selected as it is, for every row
+        value = self.compile(c, elem.expr)
+        return value if self.digest_needs_client(value, elem.expr.type) else "NULL"
+
+    def decode_raw(self, value: Any, coltype: ColType) -> Any:
+        if _storage(coltype) == "unitext":
+            # FreeTDS returns unitext as its UTF-16LE bytes
+            return bytes(value).decode("utf-16-le")
+        return super().decode_raw(value, coltype)
+
+    def normalize_digest(self, value: str, coltype: ColType) -> str:
+        source: DigestSource = coltype.digest
+        storage = _storage(coltype)
+        limit = self._digest_limit(coltype)
+        first = self._digest_index(0)
+
+        def as_string(total: str) -> str:
+            return f"convert(varchar(30), {total})"
+
+        def too_long(what: str, length: str) -> str:
+            if source.client:
+                # The client hashes it. See digest_needs_client().
+                return "null"
+            message = f"{what} can not be hashed on Sybase ASE, so compare this table with the rowhash algorithm"
+            return f"convert(varchar(30), {_error(message, length)})"
+
+        if storage == "unitext":
+            plain = SybaseText(storage="unitext")
+            utf8 = self._unicode_utf8(self._normalize_text(value, plain), plain, value)
+            if source.client:
+                guard = f"when ({self._unitext_left_to_client(value, coltype)}) = 1 then null"
+            else:
+                over = too_long(f"unitext over {limit} characters", f"char_length({value})")
+                guard = f"when char_length({value}) > {limit} then {over}"
+            return f"case when {value} is null then null {guard} else {as_string(self._digest_term(first, utf8))} end"
+
+        if storage in LOCATOR_STORAGE:
+            return self._normalize_lob_digest(value, coltype, as_string, too_long)
+
+        if isinstance(coltype, Binary):
+            # binary and varbinary hold up to 16384 bytes, which is two chunks
+            n = BINARY_DIGEST_CHUNK
+            terms = [self._digest_term(first, f"substring({value}, 1, {n})")]
+            second = self._digest_term(self._digest_index(1), f"substring({value}, {n + 1}, {n})")
+            terms.append(f"case when datalength({value}) > {n} then {second} else 0 end")
+            return f"case when {value} is null then null else {as_string(' + '.join(terms))} end"
+
+        # Text of a declared length, in up to four chunks
+        n = TEXT_DIGEST_CHUNK
+        length = getattr(coltype, "length", None) or MAX_EXPRESSION_BYTES
+        if storage in UNICODE_STORAGE:
+            text = self._normalize_text(value, coltype)
+            return f"case when {value} is null then null else {as_string(self._digest_term(first, self._unicode_utf8(text, coltype)))} end"
+        text = self._normalize_text(value, coltype)
+        chunk_type = SybaseText(storage="varchar", length=n)
+        terms = []
+        for i in range(0, -(-min(length, MAX_EXPRESSION_BYTES) // n)):
+            chunk_length = (
+                f"case when char_length({text}) >= {(i + 1) * n} then {n} else char_length({text}) - {i * n} end"
+            )
+            chunk = self._padded(f"substring({text}, {i * n + 1}, {n})", chunk_length)
+            term = self._digest_term(self._digest_index(i), self._cp850_utf8(chunk, chunk_type))
+            terms.append(term if i == 0 else f"case when char_length({text}) > {i * n} then {term} else 0 end")
+        return f"case when {value} is null then null else {as_string(' + '.join(terms))} end"
+
+    def _normalize_lob_digest(self, value: str, coltype: ColType, as_string, too_long) -> str:
+        source: DigestSource = coltype.digest
+        storage = _storage(coltype)
+        limit = self._digest_limit(coltype)
+        is_text = storage == "text"
+        n = TEXT_DIGEST_CHUNK if is_text else BINARY_DIGEST_CHUNK
+        chunk_sql_type = f"varchar({n})" if is_text else f"varbinary({n})"
+        chunk_type = SybaseText(storage="varchar", length=n)
+        length_of = "char_length" if is_text else "datalength"
+        first = self._digest_index(0)
+
+        def to_bytes(chunk: str, length: str) -> str:
+            # Converting a chunk of text drops its trailing spaces. Bytes keep their zeros.
+            return self._cp850_utf8(self._padded(chunk, length), chunk_type) if is_text else chunk
+
+        one_chunk = self._digest_term(first, to_bytes(f"convert({chunk_sql_type}, {value})", f"{length_of}({value})"))
+
+        # substring() only reads a text or image column through a locator, and ASE doesn't allow
+        # an aggregate over a column of the outer query, so the chunks come from a join of the
+        # table with itself on its key.
+        if not value.startswith("["):
+            raise NotImplementedError(f"Sybase ASE can only hash a large value from its own column, not {value}")
+        table = ".".join(map(self.quote, source.table_path))
+        inner = f"y.{value}"
+        on_key = " and ".join(f"y.{self.quote(k)} = {table}.{self.quote(k)}" for k in source.key_columns)
+        locator = f"create_locator({LOCATOR_STORAGE[storage]}, {inner})"
+        chunk = f"convert({chunk_sql_type}, substring({locator}, k.number * {n} + 1, {n}))"
+        chunk_length = (
+            f"case when (k.number + 1) * {n} <= {length_of}({inner}) then {n}"
+            f" else {length_of}({inner}) - k.number * {n} end"
+        )
+        index = "convert(varbinary(13), convert(varchar(12), k.number) + '|')"
+        chunks = (
+            f"(select sum({self._digest_term(index, to_bytes(chunk, chunk_length))})"
+            f" from master..spt_values k, {table} y"
+            f" where {on_key} and k.type = 'P' and k.number <= ({length_of}({inner}) - 1) / {n})"
+        )
+        what = f"{storage} over {limit} {'characters' if is_text else 'bytes'}"
+        return (
+            f"case when {value} is null then null"
+            f" when {length_of}({value}) <= {n} then {as_string(one_chunk)}"
+            f" when {length_of}({value}) <= {limit} then {as_string(chunks)}"
+            f" else {too_long(what, f'{length_of}({value})')} end"
+        )
 
     def md5_as_int(self, s: str) -> str:
         return f"hextobigint(right(hash({s}, 'md5'), {CHECKSUM_HEXDIGITS})) - {CHECKSUM_OFFSET}"

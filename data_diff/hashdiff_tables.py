@@ -2,12 +2,14 @@ import os
 from numbers import Number
 import logging
 from collections import defaultdict
-from typing import Any, Collection, Dict, Iterator, List, Sequence, Set, Tuple
+from typing import Any, ClassVar, Collection, Dict, Iterator, List, Sequence, Set, Tuple
 
 import attrs
 from typing_extensions import Literal
 
 from data_diff.abcs.database_types import (
+    Binary,
+    DigestSource,
     ColType_UUID,
     Native_UUID,
     NumericType,
@@ -111,6 +113,9 @@ class HashDiffer(TableDiffer):
                                    There may be many pools, so number of actual threads can be a lot higher.
     """
 
+    # Whether values that a database can't hash are fetched and hashed here, or fail the query
+    DIGEST_ON_CLIENT: ClassVar[bool] = False
+
     bisection_factor: int = DEFAULT_BISECTION_FACTOR
     bisection_threshold: int = DEFAULT_BISECTION_THRESHOLD
     bisection_disabled: bool = False  # i.e. always download the rows (used in tests)
@@ -134,6 +139,26 @@ class HashDiffer(TableDiffer):
             # Update schemas to minimal mutual precision
             col1 = table1._schema[c1]
             col2 = table2._schema[c2]
+
+            # A large value is compared by its digest, which both sides must then compute
+            dialect1, dialect2 = table1.database.dialect, table2.database.dialect
+            is_key = c1 in table1.key_columns or c2 in table2.key_columns
+            if not is_key and (dialect1.needs_digest(col1) or dialect2.needs_digest(col2)):
+                try:
+                    digest_types = [
+                        table.database.dialect.as_digest_type(
+                            col, DigestSource(tuple(table.table_path), tuple(table.key_columns), self.DIGEST_ON_CLIENT)
+                        )
+                        for table, col in ((table1, col1), (table2, col2))
+                    ]
+                except NotImplementedError as e:
+                    if isinstance(col1, Binary) or isinstance(col2, Binary):
+                        raise
+                    # Text is still compared by value, within the limits of each database
+                    logger.warning(f"Column '{c1}' is compared by value, not by digest: {e}")
+                else:
+                    table1._schema[c1], table2._schema[c2] = digest_types
+                    continue
             if isinstance(col1, PrecisionType):
                 if not isinstance(col2, PrecisionType):
                     if strict:

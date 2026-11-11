@@ -32,7 +32,7 @@ From outside the compose network, SQL Server is on host port **14330**, because 
 - **License.** The SySAM grace period ends on **Sat 06 Feb 2027 20:46 UTC**, and ASE then shuts down. `sp_lmconfig` shows the date, and so does the error log at each start. A rebuild with `scripts/build.sh --no-cache` in the image repo renews it.
 - **Data** is in the named volume `ase-data` at `/opt/sap/data`, which holds every device, `master` included. Never bind-mount it, and put new devices there, or a recreated container won't know them. Server ASE, port 5000, `sa`/`Password1`, database `testdb`.
 - **Runtime setup** is `dev/ase/init.sql`, which `dev/ase/init.py` applies over TDS. `tests/common.py` runs it on every test run, because it's idempotent. It turns on `allow nulls by default` in `testdb`, raises the procedure cache to 120000 pages, and creates the read-only login `dd_reader`. The procedure cache setting lives in the container's `ASE.cfg`, not the volume, so a recreated container needs init again.
-- **Memory.** `mem_limit` is `${ASE_MEM:-2g}`, which the image's settings fit. For the 4 GB benchmark, recreate it with `ASE_MEM=4g` and raise `max memory` and the data cache at runtime (both dynamic).
+- **Memory.** `mem_limit` is `${ASE_MEM:-2g}`, which the image's settings fit (max memory 1.5 GB, data cache 768 MB). To try more, recreate it with `ASE_MEM=4g` and raise `max memory` and the data cache at runtime (both dynamic, lost when the container is recreated). For the perf tables this isn't worth it: see Performance tests.
 - From the devcontainer, use `tsql -H ase -p 5000 -U sa -P Password1` with `TDSVER=5.0`, or `freebcp`. `docker logs dd-ase` and `docker exec` work only from WSL.
 
 ## Commands
@@ -66,7 +66,7 @@ Override connection strings in `tests/local_settings.py` (git-ignored), or use t
 | `0` | PostgreSQL against itself |
 | `full` | every configured database against every other |
 
-Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/test_cross_db_fact.py`. ASE against each database is in `tests/test_cross_db_types.py`, `tests/test_cross_db_fact.py` and `tests/test_sybase.py`, and CI's `sybase` job runs `-k Sybase -k sybase` with `TEST_ACROSS_ALL_DBS=full`.
+Db2 against SQL Server is only covered by `TEST_ACROSS_ALL_DBS=full` and `tests/test_cross_db_fact.py`. Large values are in the `LargeValue` classes of `tests/test_cross_db_types.py`, and `tests/test_rowhash.py` runs `RowHashDiffer` on every configured database. ASE against each database is in `tests/test_cross_db_types.py`, `tests/test_cross_db_fact.py` and `tests/test_sybase.py`, and CI's `sybase` job runs `-k Sybase -k sybase` with `TEST_ACROSS_ALL_DBS=full`.
 
 `N_SAMPLES` sets the row count per type test (default 50), and `N_THREADS` sets the thread count (default 1).
 
@@ -81,7 +81,9 @@ poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, wri
 
 `run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB, and the ASE trial runs in a container.
 
-With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sybase` loads it from the CSVs a previous run exported. ASE has no server-side load, so `freebcp` sends the rows over TDS into `perfdb`, which has its own devices `perfdata` (2,500 MB) and `perflog` (1,000 MB) in `/opt/sap/data`. Measured `sp_spaceused`: `fact_2x` 61 MB, `fact_13x` 399 MB. The primary key is added after the load, and `seed.py` checks counts, sums and the data-diff checksum against PostgreSQL. `run_perf.py` adds ASE in both directions against the other three. `PERF_PAIRS=Sybase:PostgreSQL,...` runs only some pairs, and `SYBASE_CONFIG` labels the results.
+With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sybase` loads it from the CSVs a previous run exported. ASE has no server-side load, so `freebcp` sends the rows over TDS into `perfdb`, which has its own devices `perfdata` (2,500 MB) and `perflog` (1,000 MB) in `/opt/sap/data`. Measured `sp_spaceused`: `fact_2x` 61 MB, `fact_13x` 399 MB. The primary key is added after the load, and `seed.py` checks counts, sums and the data-diff checksum against PostgreSQL. `run_perf.py` adds ASE in both directions against the other three. `PERF_PAIRS=Sybase:PostgreSQL,...` runs only some pairs, `PERF_ALGORITHM=rowhash` times `RowHashDiffer`, and `SYBASE_CONFIG` labels the results.
+
+The 2 GB defaults are enough. The perf tables (460 MB) already fit in the 768 MB data cache, and a run at `ASE_MEM=4g` with `max memory` at 3.25 GB and a 2 GB data cache was no faster. Timings on this machine vary by about 20% from one run to the next, so repeat a pair before treating a difference of that size as real.
 
 ## Database behavior that's easy to get wrong
 
@@ -97,7 +99,24 @@ With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sy
 - **`NVARCHAR(MAX)` is expensive on SQL Server.** It made checksums about 3 times slower, so only text columns use it. `FORMAT()` is slower still, and adds thousands separators.
 - **Db2 table and column names are case-sensitive here.** data-diff quotes them, and Db2 stores unquoted names in uppercase, so pass `FACT`, not `fact`, for a table created without quotes.
 
+### Large values
+
+- **LOB and binary columns are compared by `lob_digest`** (`data_diff/utils.py`), not by value. It's a sum of `md5(<chunk number>|<chunk>)` over 4,096-character or 8,192-byte chunks, which every dialect computes in `normalize_digest`. `HashDiffer._validate_and_adjust_columns` switches a column pair to it when either dialect's `needs_digest` says so, by replacing both column types through `as_digest_type`.
+- **Text chunks are cut by character, and must be on every database.** SQL Server `NVARCHAR` and ASE `unitext` count UTF-16 code units, so text with surrogate pairs takes a slower path or goes to the client.
+- **Cutting text by character is slow on PostgreSQL and Db2**, because finding a character reads the value from its start. Both cut ASCII text as bytes instead. Measured for text that isn't ASCII: PostgreSQL 1.1 s for 2 MB and over 50 s for 20 MB, Db2 about 4 s per MB.
+- **`RowHashDiffer` (`rowhash_tables.py`) reads each table once**: key and row hash for every row, then the differing rows by key. Only it sets `DigestSource.client`, which makes a dialect return NULL and a flag (`digest_needs_client`) for a value it can't hash, instead of failing. `TableSegment.get_rows_by_keys` then downloads and hashes that value.
+- **An aggregate can't contain a correlated subquery on SQL Server** (error 130), so a checksum over digests sums a subquery of row hashes there (`DIGEST_IN_SUBQUERY`). SQL Server, Db2 and ASE all reject an aggregate that mixes an outer column with an inner one, so each digest sums over a derived table or a self-join.
+- **Db2 can evaluate both branches of a `CASE`, and expressions for rows a `WHERE` removes.** A cast that would truncate, or a negative `SUBSTRING` length, fails even where it isn't used. `SUBSTRING(clob, start, n, OCTETS)` pads the last chunk with spaces unless the length is exact. Db2 12.1 has no hex format in `TO_NUMBER`.
+- **Row hashes treat NULL and the text `<null>` as equal**, as checksums always have. hashdiff only notices the difference in segments small enough to download.
+
 ### SAP ASE behavior
+
+- **`hash()` on a `text`, `unitext` or `image` value returns a wrong digest, without an error.** Convert to `varchar` or `varbinary` first.
+- **`substring()` rejects a LOB column, but reads it through a locator**: `substring(create_locator(text_locator, col), start, length)`, past 16,384 bytes too. Reading a chunk takes longer the further in it is: 1 MB hashes in 0.06 s and 20 MB in 81 s, so the server stops at 1,025 chunks, which is also what `master..spt_values` counts to.
+- **Converting a `unitext` locator chunk straight to `varchar` or `univarchar` stops at 225 characters.** Through `convert(text, ...)` it doesn't.
+- **A `CASE` over a `text` or `image` column returns an empty value** where it should return the value or NULL, so `render_rawforclient` selects the column as it is.
+- **FreeTDS can't send a `unitext` parameter** ("Datastream processing out of sync"), and a statement with `text`, `unitext` and `image` parameters together hangs. `text` and `image` parameters work alone. Fetching is fine: 20 MB in 0.09 s.
+- **Converting 1 MB of `text` to `unitext` runs out of `heap memory per user`.**
 
 - **The server is cp850, and FreeTDS logs in with an empty character set**, so the connection is always cp850. SQL text must only contain cp850 characters, and the dialect writes others as `U&'\XXXX'`. `set char_convert utf8` changes the server but not FreeTDS, which then corrupts the statement.
 - **No server-side UTF-8.** cp850 text goes through `univarchar`, where `str_replace` swaps each non-ASCII character for Private Use Area characters U+E000+b, one per UTF-8 byte. Then every 00 and E0 byte is removed from the UTF-16LE bytes. Swapping bytes directly can't work, because the 128 mappings form a cycle. Unicode text is converted one UTF-16 code unit at a time, which makes about 1.6 KB of SQL per character, so it has a length limit.
@@ -119,6 +138,7 @@ With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sy
 
 **Two diff algorithms.** The CLI picks joindiff when both tables are in the same database, and hashdiff otherwise:
 
+- `RowHashDiffer` (`rowhash_tables.py`, `Algorithm.ROWHASH`) also works across databases, and reads each table once. It's never picked automatically. See Large values.
 - `HashDiffer` (`hashdiff_tables.py`) works across databases. It splits the key range into segments, compares `count_and_checksum()` from each side, and recurses into segments that differ. Below `bisection_threshold` it downloads the rows and compares them locally.
 - `JoinDiffer` (`joindiff_tables.py`) works within one database, using an outer join. It has `isinstance` branches per database (`MsSQL`, `Oracle`, `MySQL` and others) for SQL that doesn't generalize, so a new database may need its own branch here.
 

@@ -1,4 +1,4 @@
-from typing import Any, ClassVar, Dict, List, Type
+from typing import Any, ClassVar, Dict, List, Optional, Type
 from urllib.parse import unquote
 import attrs
 
@@ -6,6 +6,10 @@ from data_diff.abcs.database_types import (
     ColType,
     DbPath,
     JSON,
+    Binary,
+    ColType_UUID,
+    DigestSource,
+    StringType,
     Timestamp,
     TimestampTZ,
     Float,
@@ -20,6 +24,7 @@ from data_diff.abcs.database_types import (
     Time,
 )
 from data_diff.databases.base import BaseDialect, ThreadedDatabase, import_helper, ConnectError
+from data_diff.utils import BINARY_DIGEST_CHUNK, DIGEST_HEXDIGITS, TEXT_DIGEST_CHUNK
 from data_diff.databases.base import (
     MD5_HEXDIGITS,
     CHECKSUM_HEXDIGITS,
@@ -29,6 +34,9 @@ from data_diff.databases.base import (
 )
 
 SESSION_TIME_ZONE = None  # Changed by the tests
+
+# Multibyte text longer than this is hashed by the client, when the differ allows it
+MAX_MULTIBYTE_DIGEST_CHARS = 1_000_000
 
 
 @import_helper("postgresql")
@@ -73,6 +81,7 @@ class PostgresqlDialect(BaseDialect):
         "character varying": Text,
         "varchar": Text,
         "text": Text,
+        "bytea": Binary,
         "json": JSON,
         "jsonb": JSON,
         "uuid": Native_UUID,
@@ -171,6 +180,64 @@ class PostgresqlDialect(BaseDialect):
 
     def normalize_json(self, value: str, _coltype: JSON) -> str:
         return f"{value}::text"
+
+    # Large values. md5() takes a value of any size, but the digest must match databases that
+    # can only hash a piece at a time, so it's computed in the same pieces.
+
+    def as_digest_type(self, coltype: ColType, source: DigestSource) -> ColType:
+        if isinstance(coltype, (StringType, ColType_UUID)):
+            # Whatever sampling refined the column to, the other side holds plain text
+            return Text(digest=source)
+        return super().as_digest_type(coltype, source)
+
+    def _digest_int(self, s: str) -> str:
+        return f"('x' || right(md5({s}), {DIGEST_HEXDIGITS}))::bit({4 * DIGEST_HEXDIGITS})::bigint"
+
+    def digest_needs_client(self, value: str, coltype: ColType) -> Optional[str]:
+        digest = getattr(coltype, "digest", None)
+        if digest is None or not digest.client or isinstance(coltype, Binary):
+            return None
+        # Finding the Nth character of multibyte text means reading it from the start, so the
+        # time grows with the square of the length: about 1 second for 2 MB, and 100 for 20 MB.
+        v = f"{value}::text"
+        return f"(char_length({v}) > {MAX_MULTIBYTE_DIGEST_CHARS} and octet_length({v}) <> char_length({v}))"
+
+    def normalize_digest(self, value: str, coltype: ColType) -> str:
+        index = "convert_to(i::text || '|', 'UTF8')"
+        if isinstance(coltype, Binary):
+            n = BINARY_DIGEST_CHUNK
+            # OFFSET 0 keeps the value from being read again for each chunk
+            chunks = (
+                f"(select sum({self._digest_int(f'{index} || substring(b.v from i * {n} + 1 for {n})')})::text"
+                f" from (select {value} || ''::bytea as v offset 0) b,"
+                f" generate_series(0, (octet_length(b.v) - 1) / {n}) i)"
+            )
+            return f"case when {value} is null then null when octet_length({value}) = 0 then '0' else {chunks} end"
+
+        n = TEXT_DIGEST_CHUNK
+        v = f"{value}::text"
+        # ASCII text has one byte for each character, so it's cut as bytes, which takes the same
+        # time for every chunk
+        ascii_chunks = (
+            f"(select sum({self._digest_int(f'{index} || substring(b.v from i * {n} + 1 for {n})')})::text"
+            f" from (select convert_to({v}, 'UTF8') as v offset 0) b,"
+            f" generate_series(0, (octet_length(b.v) - 1) / {n}) i)"
+        )
+        text_piece = self._digest_int(f"i::text || '|' || substring(b.v from i * {n} + 1 for {n})")
+        text_chunks = (
+            f"(select sum({text_piece})::text from (select {v} || '' as v offset 0) b,"
+            f" generate_series(0, (char_length(b.v) - 1) / {n}) i)"
+        )
+        one_chunk = self._digest_int(f"'0|' || {v}")
+        left_to_client = self.digest_needs_client(value, coltype)
+        return (
+            f"case when {value} is null then null"
+            f" when {v} = '' then '0'"
+            + (f" when {left_to_client} then null" if left_to_client else "")
+            + f" when char_length({v}) <= {n} then {one_chunk}::text"
+            f" when octet_length({v}) = char_length({v}) then {ascii_chunks}"
+            f" else {text_chunks} end"
+        )
 
 
 @attrs.define(frozen=False, init=False, kw_only=True)

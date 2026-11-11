@@ -6,6 +6,7 @@ from data_diff.tracking import disable_tracking
 from data_diff.databases._connect import connect
 from data_diff.diff_tables import Algorithm
 from data_diff.hashdiff_tables import HashDiffer, DEFAULT_BISECTION_THRESHOLD, DEFAULT_BISECTION_FACTOR
+from data_diff.rowhash_tables import RowHashDiffer
 from data_diff.joindiff_tables import JoinDiffer, TABLE_WRITE_LIMIT
 from data_diff.table_segment import TableSegment
 from data_diff.utils import eval_name_template, Vector
@@ -98,7 +99,9 @@ def diff_tables(
                                    Only relevant when `threaded` is ``True``.
                                    There may be many pools, so number of actual threads can be a lot higher.
         where (str, optional): An additional 'where' expression to restrict the search space.
-        algorithm (:class:`Algorithm`): Which diffing algorithm to use (`HASHDIFF` or `JOINDIFF`. Default=`AUTO`)
+        algorithm (:class:`Algorithm`): Which diffing algorithm to use (`HASHDIFF`, `JOINDIFF` or `ROWHASH`. Default=`AUTO`).
+                                       `ROWHASH` reads each table once, and is the one to use for large text
+                                       and binary values that a database can't hash by itself.
         bisection_factor (int): Into how many segments to bisect per iteration. (Used when algorithm is `HASHDIFF`)
         bisection_threshold (Number): Minimal row count of segment to bisect, otherwise download
                                       and compare locally. (Used when algorithm is `HASHDIFF`).
@@ -153,7 +156,9 @@ def diff_tables(
     if algorithm == Algorithm.AUTO:
         algorithm = Algorithm.JOINDIFF if table1.database is table2.database else Algorithm.HASHDIFF
 
-    if algorithm == Algorithm.HASHDIFF:
+    if algorithm == Algorithm.ROWHASH:
+        differ = RowHashDiffer(threaded=threaded, max_threadpool_size=max_threadpool_size)
+    elif algorithm == Algorithm.HASHDIFF:
         differ = HashDiffer(
             bisection_factor=bisection_factor,
             bisection_threshold=bisection_threshold,

@@ -33,7 +33,14 @@ import attrs
 from typing_extensions import Self
 
 from data_diff.abcs.compiler import AbstractCompiler, Compilable
-from data_diff.queries.extras import ApplyFuncAndNormalizeAsString, Checksum, NormalizeAsString
+from data_diff.queries.extras import (
+    ApplyFuncAndNormalizeAsString,
+    Checksum,
+    DigestNeedsClient,
+    NormalizeAsString,
+    RawForClient,
+    RowHash,
+)
 from data_diff.schema import RawColumnInfo
 from data_diff.utils import ArithString, ArithUUID, is_uuid, join_iter, safezip
 from data_diff.queries.api import Expr, table, Select, SKIP, Explain, Code, this
@@ -71,6 +78,8 @@ from data_diff.queries.ast_classes import (
 )
 from data_diff.abcs.database_types import (
     Array,
+    Binary,
+    DigestSource,
     ColType_UUID,
     FractionalType,
     Struct,
@@ -289,6 +298,12 @@ class BaseDialect(abc.ABC):
             return self.render_applyfuncandnormalizeasstring(c, elem)
         elif isinstance(elem, Checksum):
             return self.render_checksum(c, elem)
+        elif isinstance(elem, RowHash):
+            return self.render_rowhash(c, elem)
+        elif isinstance(elem, DigestNeedsClient):
+            return self.render_digestneedsclient(c, elem)
+        elif isinstance(elem, RawForClient):
+            return self.render_rawforclient(c, elem)
         elif isinstance(elem, Concat):
             return self.render_concat(c, elem)
         elif isinstance(elem, Func):
@@ -410,6 +425,21 @@ class BaseDialect(abc.ABC):
         return self.compile(c, expr)
 
     def render_checksum(self, c: Compiler, elem: Checksum) -> str:
+        return f"sum({self.render_rowhash(c, elem)})"
+
+    def render_digestneedsclient(self, c: Compiler, elem: DigestNeedsClient) -> str:
+        conditions = [self.digest_needs_client(self.compile(c, e), e.type) for e in elem.exprs]
+        conditions = [condition for condition in conditions if condition]
+        return f"case when {' or '.join(conditions)} then 1 else 0 end" if conditions else "0"
+
+    def render_rawforclient(self, c: Compiler, elem: RawForClient) -> str:
+        value = self.compile(c, elem.expr)
+        condition = self.digest_needs_client(value, elem.expr.type)
+        if not condition:
+            return "NULL"
+        return f"case when {condition} then {self.digest_raw(value, elem.expr.type)} end"
+
+    def render_rowhash(self, c: Compiler, elem: Union[Checksum, RowHash]) -> str:
         if len(elem.exprs) > 1:
             exprs = [Code(f"coalesce({self.compile(c, expr)}, '<null>')") for expr in elem.exprs]
             # exprs = [self.compile(c, e) for e in exprs]
@@ -418,8 +448,7 @@ class BaseDialect(abc.ABC):
             # No need to coalesce - safe to assume that key cannot be null
             (expr,) = elem.exprs
         expr = self.compile(c, expr)
-        md5 = self.md5_as_int(expr)
-        return f"sum({md5})"
+        return self.md5_as_int(expr)
 
     def render_concat(self, c: Compiler, elem: Concat) -> str:
         if self._prevent_overflow_when_concat:
@@ -770,7 +799,7 @@ class BaseDialect(abc.ABC):
                 )
             )
 
-        elif issubclass(cls, (JSON, Array, Struct, Text, Native_UUID)):
+        elif issubclass(cls, (JSON, Array, Struct, Text, Native_UUID, Binary)):
             return cls()
 
         raise TypeError(f"Parsing {info.data_type} returned an unknown type {cls!r}.")
@@ -870,6 +899,39 @@ class BaseDialect(abc.ABC):
         """Creates an SQL expression, that serialized a typed struct into a JSON string."""
         return self.to_string(value)
 
+    # Large values, compared by digest. See data_diff.utils.lob_digest.
+
+    # Whether a checksum over digests must sum the row hashes of a subquery
+    DIGEST_IN_SUBQUERY: ClassVar[bool] = False
+
+    def needs_digest(self, coltype: ColType) -> bool:
+        """Whether values of this type can only be compared by digest."""
+        return isinstance(coltype, Binary)
+
+    def as_digest_type(self, coltype: ColType, source: DigestSource) -> ColType:
+        """The type to use for a column that's compared by digest, in place of ``coltype``."""
+        if isinstance(coltype, Binary):
+            return attrs.evolve(coltype, digest=source)
+        raise NotImplementedError(
+            f"{self.name} can't compare large values yet, which column type {coltype} is paired with."
+        )
+
+    def normalize_digest(self, value: str, coltype: ColType) -> str:
+        """SQL for ``lob_digest`` of the value, as a string."""
+        raise NotImplementedError(f"{self.name} can't compare large values yet.")
+
+    def digest_needs_client(self, value: str, coltype: ColType) -> Optional[str]:
+        """A SQL condition that's true for the values ``normalize_digest`` leaves to the client."""
+        return None
+
+    def digest_raw(self, value: str, coltype: ColType) -> str:
+        """SQL for the value itself, in a form ``decode_raw`` reads."""
+        return value
+
+    def decode_raw(self, value: Any, coltype: ColType) -> Union[str, bytes]:
+        """What the driver returned for ``digest_raw``, as text or bytes for ``lob_digest``."""
+        return bytes(value) if isinstance(coltype, Binary) else value
+
     def normalize_value_by_type(self, value: str, coltype: ColType) -> str:
         """Creates an SQL expression, that converts 'value' to a normalized representation.
 
@@ -886,6 +948,8 @@ class BaseDialect(abc.ABC):
             (`Integer` falls in the *else* category)
 
         """
+        if getattr(coltype, "digest", None) is not None:
+            return self.normalize_digest(value, coltype)
         if isinstance(coltype, TemporalType):
             return self.normalize_timestamp(value, coltype)
         elif isinstance(coltype, FractionalType):
