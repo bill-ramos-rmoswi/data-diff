@@ -10,8 +10,16 @@ Use `dev/probe.py`, not a hand-written driver script. It connects through data-d
 ```shell
 poetry run python dev/probe.py <dbs> "<sql>"            # dbs: postgres,mssql,db2,sybase,mysql or all
 poetry run python dev/probe.py <dbs> -f <file.sql>      # for long SQL; write the file to the scratchpad
-poetry run python dev/probe.py sybase --perf "<sql>"    # ASE's perfdb (fact_2x, fact_13x) instead of testdb
-poetry run python dev/probe.py postgres --repeat 3 "<sql>"   # median time of 3 runs
+poetry run python dev/probe.py sybase "<sql>" --perf    # ASE's perfdb (fact_2x, fact_13x) instead of testdb
+poetry run python dev/probe.py postgres "<sql>" --repeat 3   # median time of 3 runs
+```
+
+Options go after the SQL: `probe.py sybase --perf "<sql>"` fails with "unrecognized arguments".
+
+To check that a change to checksum SQL keeps the values, run `dev/perf/checksum.py` before and after it. It prints the count, the full data-diff checksum and the time of a perf table on each database, and exits with 1 if they differ. `SHOW_SQL=1` prints the SQL.
+
+```shell
+poetry run python dev/perf/checksum.py fact_2x PostgreSQL,Db2,Sybase,MsSQL
 ```
 
 ## Before you write the SQL

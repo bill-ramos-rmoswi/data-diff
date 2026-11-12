@@ -19,7 +19,7 @@ Unless the user says otherwise, the README is for on-prem → Aurora PostgreSQL:
 
 ```shell
 poetry run python dev/probe.py postgres "select count(*) from fact_13x"
-poetry run python dev/probe.py sybase --perf "select count(*) from fact_13x"
+poetry run python dev/probe.py sybase "select count(*) from fact_13x" --perf
 ```
 
 If a count is missing or wrong, seed: `poetry run python dev/perf/seed.py` (about 1 minute), or `--only sybase` for ASE alone.
@@ -43,6 +43,7 @@ PERF_PAIRS=Db2:PostgreSQL,MsSQL:PostgreSQL,Sybase:PostgreSQL \
 - For a before and after comparison, run both on the same machine, at least twice, alternating. A gap under 20% isn't a result until it repeats.
 - Report a table: pair, table, scenario (identical, updated, deleted), median seconds, and the change in %.
 - Say what the numbers aren't: Db2 Community Edition is limited to 4 cores and 16 GB, and ASE is a trial in a container.
+- Before timing a change to checksum SQL, check that it keeps the values: `poetry run python dev/perf/checksum.py fact_13x PostgreSQL,Db2,Sybase,MsSQL` must print one checksum, on master and on the branch. It also times the checksum alone, without bisection.
 - When you update the README, change only the pairs in scope, and give the revision the numbers came from.
 
 ## Examples
