@@ -184,8 +184,23 @@ If you pass `--stats` you'll see stats such as the % of rows were different.
   `updated_at` and the most critical value, such as a money value in `amount`, but
   not verify a large serialized column like `json_settings`.
 * We have ideas for making **data-diff** even faster that
-  we haven't implemented yet: faster checksums by reducing type-casts
-  and using a faster hash than MD5, dynamic adaptation of
+  we haven't implemented yet: using a faster hash than MD5, dynamic adaptation of
   `bisection_factor`/`threads`/`bisection_threshold` (especially with large key
   gaps), and improvements to bypass Python/driver performance limitations when
   comparing huge amounts of rows locally (i.e. for very high `bisection_threshold` values).
+
+### Tried: reducing type-casts in checksums (not merged)
+
+We shortened the checksum SQL for Db2 and SAP ASE: Db2 took the MD5 tail with `TRANSLATE`, rendered `DATE` with
+`CHAR(x, ISO)` and coalesced each column once. Both skipped `ROUND` and the decimal cast when a `DECIMAL` or `numeric`
+already had the compared scale. All 1592 tests passed, and the checksums were identical to master on PostgreSQL, Db2
+and ASE.
+
+The checksum alone got faster on `fact_13x`: Db2 10.3-10.7 s to 8.55 s, ASE 14.5 s to 13.5 s. In full diffs, which also
+bisect and download rows, the median of 3 alternating runs against master moved by 0-5% for Db2, SQL Server and ASE
+to PostgreSQL on `fact_2x` (1.55M rows) and `fact_13x` (10.09M rows). Run-to-run noise on this machine is about 20%, so
+this is not a result, and we stopped. SQL Server, where the change did nothing, was flat as expected.
+
+The work is kept at the tag `archive/perf-fewer-casts` (6 commits). Not tried: Db2 renders integers as
+`VARCHAR(VARCHAR(x))`, a double cast. Db2 `DATE` against PostgreSQL `TIMESTAMP(0)` at midnight gives different
+checksums, and MySQL renders `DATE` with a time part. Both differences were seen on the branch and not checked on master.
