@@ -17,7 +17,7 @@ You need Python 3.9 or later, and:
 - On Linux, glibc 2.34 or later for the Db2 driver.
 
 ```shell
-pip install "data-diff[db2,mssql,postgresql,sybase] @ https://github.com/bill-ramos-rmoswi/data-diff/releases/download/v0.14.0/data_diff-0.14.0-py3-none-any.whl"
+pip install "data-diff[db2,mssql,postgresql,sybase] @ https://github.com/bill-ramos-rmoswi/data-diff/releases/download/v0.15.0/data_diff-0.15.0-py3-none-any.whl"
 ```
 
 ## Compare tables
