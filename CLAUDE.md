@@ -98,7 +98,7 @@ Benchmark only on the matched rig, so that every database gets 4 pinned vCPUs an
 ```shell
 docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --wait postgres mssql db2     # in WSL
 docker compose -f docker-compose.yml -f docker-compose.bench.yml --profile ase up -d --wait ase
-poetry run python dev/bench/rig.py apply     # in the devcontainer. It may print a Db2 or ASE restart
+poetry run python dev/bench/rig.py apply     # in the devcontainer. It prints a Db2 restart to run in WSL
 poetry run python dev/bench/rig.py check     # must end with "Rig: bench"; writes .runs/rig.json
 ```
 
