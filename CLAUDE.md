@@ -106,8 +106,17 @@ poetry run python dev/bench/rig.py check     # must end with "Rig: bench"; write
 - **Settings stay** after `rig.py apply`: SQL Server's and Db2's in their volumes, and ASE's until its container is recreated. `rig.py apply --profile everyday` puts them back.
 - **Comparing revisions.** `dev/perf/ab.py --base <rev> --runs 5 <tables>` alternates the base revision (from a worktree) with the working tree, and its verdict counts a change only beyond twice the noise it measured. `--base HEAD` measures the noise alone.
 - **Before optimizing a step,** run `dev/perf/profile_diff.py <source> <target> <table>`. It splits a diff's wall time into checksum, key range, download and client-only time, and that share caps the gain. In the fewer-casts experiment, checksums got 8–16% faster, but full diffs only 0–5%.
+- **Bisection threshold: 16,384 stays.** A sweep of 16k to 512k (3 pairs to PostgreSQL, `fact_13x` and `oltp_order_line`, updated and dense, 2 repeats) found none faster beyond 2 times the noise on every table, and 256k and above cost up to +405%. Before the branch's changes SQL Server was 33-47% faster at 262,144. That is gone, because its checksums got cheaper, the differ runs up to 8 queries at once, and Db2 leaves are cheap. A dynamic factor, 8 and 128 gave nothing in the earlier serial runs.
 - **Timing one checksum alone:** `dev/perf/checksum.py`.
 - **What pinning can't control.** The host's Core Ultra 7 255H has P, E and LP-E cores, and Hyper-V can move WSL's vCPUs between them. `rig.py check --noise 5` measures what noise is left. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB, and the ASE trial runs in a container.
+
+`dev/perf/seed_oltp.py` adds `oltp_order_line` to all four databases (2M rows, about 330 bytes of text per row, composite key `(OrderId, LineNumber)`, NULLs in 4 columns). It takes 3-5 minutes, so run it in the background, and `--check` only compares the databases. `run_perf.py`, `ab.py`, `profile_diff.py` and `checksum.py` take `--shape fact|oltp`, which defaults by table name. Other perf tooling:
+
+- `PERF_POOL` sets the differ's thread pool in `run_perf.py`.
+- `profile_diff.py` has a `dense` scenario (clustered changes, 15,600 rows in `fact`, 1,680 in `oltp`), `--bisection-factor`, `--bisection-threshold` and `--max-threadpool-size`. It prints queries, rows downloaded and the time by side, and exits 1 unless the diff reports exactly the changed keys.
+- `ab.py` runs the working tree's `run_perf.py` on both sides, and takes only the library from the base worktree.
+
+**ASE `freebcp` loads nothing from a CSV row of about 256 characters or more** (error 4853, "badly formatted rows"), and still prints "N rows copied". Rows under 240 load. `seed_oltp.py` cuts the CSV into column groups under 250 characters, loads them into staging tables, and joins them on the server. Any wider load into ASE needs the same.
 
 With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sybase` loads it from the CSVs a previous run exported. ASE has no server-side load, so `freebcp` sends the rows over TDS into `perfdb`, which has its own devices `perfdata` (2,500 MB) and `perflog` (1,000 MB) in `/opt/sap/data`. Measured `sp_spaceused`: `fact_2x` 61 MB, `fact_13x` 399 MB. The primary key is added after the load, and `seed.py` checks counts, sums and the data-diff checksum against PostgreSQL. `run_perf.py` adds ASE in both directions against the other three. `PERF_PAIRS=Sybase:PostgreSQL,...` runs only some pairs, `PERF_ALGORITHM=rowhash` times `RowHashDiffer`, and `SYBASE_CONFIG` labels the results.
 
@@ -123,7 +132,8 @@ The 2 GB defaults are enough for ASE on its own. The perf tables (460 MB) alread
 - **`coltype.rounds` applies to `TIME` too.** PostgreSQL, SQL Server and Db2 truncate when it's false, but Snowflake and BigQuery still round. A truncating side can be the lowest precision at 7 digits, so cap at 6.
 - **SQL Server `uniqueidentifier` doesn't sort like a string**, and renders in uppercase. Key ranges compare it through `key_range_expr`, which can't use an index, so these keys are slower.
 - **Locale collations hide casing bugs.** PostgreSQL's default sort ignores case, so test string keys on a binary collation too. Db2 and DuckDB use one.
-- **Close API connections.** PostgreSQL connections from `connect_to_table` stay in a transaction, which blocks `DROP TABLE`. Call `segment.database.close()` when done.
+- **Close API connections.** PostgreSQL connections from `connect_to_table` stay in a transaction, which blocks `DROP TABLE`. Call `segment.database.close()` when done. `connect_to_table` returns one shared `Database` per URI and thread count, so parallel diffs must close it only after all of them finish. Closed by the first to finish, it fails the others with "cannot schedule new futures after shutdown" (`tests/test_sybase.py` did this).
+- **`diff_tables()` derives `max_threadpool_size` from `thread_count`** when it isn't passed: `max(2, 2 * max(thread_count))`, like the CLI. The API default used to be 1, so segments ran one at a time. An explicit value wins, `None` included, and 1 gives the old serial order. Results can now arrive in another order, so compare sorted lists.
 - **`NVARCHAR(MAX)` is expensive on SQL Server.** It made checksums about 3 times slower, so only text columns use it. `FORMAT()` is slower still, and adds thousands separators.
 - **Db2 table and column names are case-sensitive here.** data-diff quotes them, and Db2 stores unquoted names in uppercase, so pass `FACT`, not `fact`, for a table created without quotes.
 
@@ -136,6 +146,18 @@ The 2 GB defaults are enough for ASE on its own. The perf tables (460 MB) alread
 - **An aggregate can't contain a correlated subquery on SQL Server** (error 130), so a checksum over digests sums a subquery of row hashes there (`DIGEST_IN_SUBQUERY`). SQL Server, Db2 and ASE all reject an aggregate that mixes an outer column with an inner one, so each digest sums over a derived table or a self-join.
 - **Db2 can evaluate both branches of a `CASE`, and expressions for rows a `WHERE` removes.** A cast that would truncate, or a negative `SUBSTRING` length, fails even where it isn't used. `SUBSTRING(clob, start, n, OCTETS)` pads the last chunk with spaces unless the length is exact. Db2 12.1 has no hex format in `TO_NUMBER`.
 - **Row hashes treat NULL and the text `<null>` as equal**, as checksums always have. hashdiff only notices the difference in segments small enough to download.
+
+### Leaf row hash (Db2 and PostgreSQL)
+
+- **A small hashdiff segment compares row hashes, not values**, when the dialect sets `LEAF_ROW_HASH` (PostgreSQL and Db2; not Redshift). `get_key_hashes(null_mask=True)` returns each row's key, hash and a NULL mask (a sum of `CASE WHEN c IS NULL THEN 2^i ELSE 0 END`, 62 columns per integer), and only the differing keys are fetched, 500 at a time, by `get_rows_by_keys`. The mask is there so that NULL and the text `<null>` differ.
+- **It falls back to downloading every row** when the rows fetched by key don't match the keys the hashes listed (a text UUID key in mixed case, say), when a key can't be made into the key type, and when more than half the leaf's rows, and more than 500, differ.
+- **Blind spot:** text with `|` that moves between neighboring columns (`'a|b','c'` against `'a','b|c'`) has the same row hash. Checksums and `RowHashDiffer` share it, but a leaf used to catch it when its segment differed for another reason. Closing it needs a different row hash shape.
+- Stats: `rows_downloaded` counts the hash rows, `rows_fetched_by_key` the fetched ones.
+
+### SQL Server hash input
+
+- **Declared-length text is hashed as `NVARCHAR(n)`, without `MAX`.** `MsSQL.query_table_schema` reads `CHARACTER_MAXIMUM_LENGTH` into `StringType.max_length`. A concat of ASCII columns (numbers, dates, native UUIDs) is hashed directly. Text with a bound of at most 2,666 UTF-16 units goes through `NVARCHAR(B)` and then `VARCHAR(3B)` in UTF-8, and anything else uses `MAX`, because the bounded form truncates silently above 2,666.
+- **`varchar(8000)` columns still use `MAX`**, as does anything that isn't a bounded text. `numeric` isn't in MsSQL's `TYPE_CLASSES` (only `decimal`), so it parses as `UnknownColType` and hashes as `NVARCHAR(MAX)` text. Adding it is a possible follow-up, and untested.
 
 ### SAP ASE behavior
 
