@@ -4,7 +4,13 @@ Run this in the devcontainer, after dev/perf/seed.py:
 
     poetry run python dev/perf/run_perf.py fact_2x fact_13x
 
+    poetry run python dev/perf/run_perf.py --shape oltp oltp_order_line
+
 PERF_ALGORITHM=rowhash times the algorithm that reads each table once, instead of hashdiff.
+PERF_POOL sets diff_tables(max_threadpool_size=...), the differ's own thread pool. Unset, the
+library default applies. --shape picks the key, columns and changed rows (SHAPES below): fact
+for the fact_* tables of dev/perf/seed.py (the default), oltp for oltp_order_line, which the
+tuning run's seed_oltp.py loads.
 
 Each pair runs three scenarios, which change the target table and then restore it: identical
 tables, updated rows, and deleted rows. A run fails if data-diff doesn't report exactly the rows
@@ -15,6 +21,7 @@ Before each scenario it prints a timestamped "[i/N] start" line, and appends it 
 PERF_PROGRESS_FILE too when that's set, so dev/status.sh can show how far a long run is. Each
 result records the rig that dev/bench/rig.py check last saw (.runs/rig.json, or PERF_RIG_FILE).
 """
+import argparse
 import json
 import os
 import subprocess
@@ -46,6 +53,8 @@ if os.environ.get("DATADIFF_SYBASE_URI"):
 if os.environ.get("PERF_PAIRS"):
     # For example PERF_PAIRS=Sybase:PostgreSQL,PostgreSQL:Sybase
     PAIRS = [tuple(pair.split(":")) for pair in os.environ["PERF_PAIRS"].split(",")]
+# The differ's own thread pool, diff_tables(max_threadpool_size=...). Unset means the library default.
+POOL = int(os.environ["PERF_POOL"]) if os.environ.get("PERF_POOL") else None
 # hashdiff checksums segments and bisects those that differ. rowhash reads each table once.
 ALGORITHM = os.environ.get("PERF_ALGORITHM", "hashdiff")
 # Describes the ASE server for the results, such as "2g image defaults"
@@ -91,13 +100,49 @@ PRODUCT_KEYS = ", ".join(str(key) for key in range(5, 610, 5))
 SAVED_TABLE = "perf_saved"
 
 
+def _between_any(column: str, ranges) -> str:
+    return "(" + " OR ".join(f"{column} BETWEEN {low} AND {high}" for low, high in ranges) + ")"
+
+
+# Table shapes: key, the extra columns compared, the column the scenarios change, and which rows they
+# change. "where" is the updated and deleted scenarios' rows: about 0.016% of the table, spread across
+# it. "dense" (dev/perf/profile_diff.py only) changes about 10 times as many rows, in clusters. Neither
+# needs a dialect-specific operator.
+SHAPES = {
+    "fact": dict(
+        key=KEY_COLUMNS,
+        extra=EXTRA_COLUMNS,
+        update="UnitCost",
+        where=lambda q: f"{q('DateKey')} = 20130615 AND {q('ProductKey')} IN ({PRODUCT_KEYS})",
+        # 40 products for a month, in each of the 13 ScaleKeys: 15,600 rows of fact_13x in 13 clusters
+        dense=lambda q: f"{q('ProductKey')} BETWEEN 300 AND 339 AND {q('DateKey')} BETWEEN 20130601 AND 20130630",
+    ),
+    "oltp": dict(
+        key=("OrderId", "LineNumber"),
+        extra=(
+            "ProductCode", "ProductName", "CustomerName", "Comment", "TrackingNumber", "Quantity", "UnitPrice",
+            "Discount", "LineTotal", "OrderDate", "ShipDate", "ModifiedDate",
+        ),
+        update="Quantity",
+        # Line 1 of every 3,000th order: 166 rows
+        where=lambda q: f"{q('LineNumber')} = 1 AND {q('OrderId')} IN ({', '.join(str(i) for i in range(3000, 500000, 3000))})",
+        # Every line of 42 orders, in 10 clusters 50,000 orders apart: 1,680 rows
+        dense=lambda q: _between_any(q("OrderId"), [(start + 1, start + 42) for start in range(0, 500000, 50000)]),
+    ),
+}  # fmt: skip
+SHAPE = SHAPES["fact"]
+
+
+def default_shape(table: str) -> str:
+    return "oltp" if table.startswith("oltp_") else "fact"
+
+
 def changed_rows(conn, table_sql: str) -> str:
-    quote = conn.dialect.quote
-    return f"{table_sql} WHERE {quote('DateKey')} = 20130615 AND {quote('ProductKey')} IN ({PRODUCT_KEYS})"
+    return f"{table_sql} WHERE {SHAPE['where'](conn.dialect.quote)}"
 
 
 def changed_keys(conn, table_sql: str) -> set:
-    columns = ", ".join(conn.dialect.quote(column) for column in KEY_COLUMNS)
+    columns = ", ".join(conn.dialect.quote(column) for column in SHAPE["key"])
     return {
         tuple(str(value) for value in row)
         for row in conn.query(f"SELECT {columns} FROM {changed_rows(conn, table_sql)}", list)
@@ -121,11 +166,12 @@ def restore_rows(conn, table_sql: str):
 
 def run_diff(source: str, target: str, table: str):
     tables = [
-        connect_to_table(URIS[db_name], table, KEY_COLUMNS, thread_count=THREADS, extra_columns=EXTRA_COLUMNS)
+        connect_to_table(URIS[db_name], table, SHAPE["key"], thread_count=THREADS, extra_columns=SHAPE["extra"])
         for db_name in (source, target)
     ]
+    pool = {} if POOL is None else {"max_threadpool_size": POOL}
     start = time.monotonic()
-    diff = list(diff_tables(*tables, algorithm=ALGORITHM))
+    diff = list(diff_tables(*tables, algorithm=ALGORITHM, **pool))
     duration = time.monotonic() - start
     for segment in tables:
         segment.database.close()
@@ -133,7 +179,7 @@ def run_diff(source: str, target: str, table: str):
 
 
 def check(scenario: str, diff: list, expected_keys: set, signs: set):
-    actual_keys = {row[: len(KEY_COLUMNS)] for _, row in diff}
+    actual_keys = {row[: len(SHAPE["key"])] for _, row in diff}
     expected_lines = len(expected_keys) * len(signs)
     if actual_keys != expected_keys or len(diff) != expected_lines or {sign for sign, _ in diff} != signs:
         raise AssertionError(
@@ -164,13 +210,14 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
             "name_human": f"{source}/{target} {scenario}",
             "src_table": table,
             "target_table": table,
-            "source_type": "fact",
+            "source_type": SHAPE_NAME,
             "target_type": scenario,
             "count_max_sec": 0,
             "checksum_sec": round(duration, 3),
             "download_sec": 0,
             "changed_rows": len(keys) if scenario != "identical" else 0,
             "threads": THREADS,
+            "pool": POOL,
             "algorithm": ALGORITHM,
             "rig": RIG,
         }
@@ -187,10 +234,9 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
     check("identical", diff, set(), set())
     record("identical", duration, len(diff))
 
-    cost = quote("UnitCost")
-    conn.query(
-        f"UPDATE {table_sql} SET {cost} = {cost} + 1 WHERE {changed_rows(conn, table_sql).split(' WHERE ')[1]}", None
-    )
+    cost = quote(SHAPE["update"])
+    where = SHAPE["where"](quote)
+    conn.query(f"UPDATE {table_sql} SET {cost} = {cost} + 1 WHERE {where}", None)
     conn.query(commit)
     try:
         step("updated")
@@ -198,10 +244,7 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
         check("updated", diff, keys, {"-", "+"})
         record("updated", duration, len(diff))
     finally:
-        conn.query(
-            f"UPDATE {table_sql} SET {cost} = {cost} - 1 WHERE {changed_rows(conn, table_sql).split(' WHERE ')[1]}",
-            None,
-        )
+        conn.query(f"UPDATE {table_sql} SET {cost} = {cost} - 1 WHERE {where}", None)
         conn.query(commit)
 
     save_rows(conn, table_sql)
@@ -219,19 +262,30 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
 
 
 RIG = None
+SHAPE_NAME = "fact"
 
 
 def main():
-    global RIG
+    global RIG, SHAPE, SHAPE_NAME
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("tables", nargs="*", default=["fact_2x"])
+    p.add_argument("--shape", choices=list(SHAPES), help="default: oltp for oltp_* tables, else fact")
+    args = p.parse_args()
+    tables = args.tables
     revision = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
-    tables = sys.argv[1:] or ["fact_2x"]
     RIG = rig_fingerprint()
     PROGRESS.total = len(tables) * len(PAIRS) * 3
     for table in tables:
+        SHAPE_NAME = args.shape or default_shape(table)
+        SHAPE = SHAPES[SHAPE_NAME]
         conn = connect(URIS["PostgreSQL"], shared=False)
         row_count = conn.query(f"SELECT count(*) FROM {table}", int)
         conn.close()
-        print(f"{table}: {row_count:,} rows, {THREADS} threads per database", flush=True)
+        print(
+            f"{table}: {row_count:,} rows, {SHAPE_NAME} shape, {THREADS} threads per database, "
+            f"differ pool {POOL or 'library default'}",
+            flush=True,
+        )
         for source, target in PAIRS:
             run_pair(source, target, table, row_count, revision)
 
