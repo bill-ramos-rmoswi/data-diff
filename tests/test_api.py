@@ -1,10 +1,20 @@
 from datetime import datetime, timedelta
+from types import SimpleNamespace
+import unittest
 
-from data_diff import diff_tables, connect_to_table, Algorithm
+from data_diff import diff_tables, connect_to_table, Algorithm, derived_threadpool_size
 from data_diff.databases.mysql import MySQL
+from data_diff.databases.postgresql import PostgreSQL
 from data_diff.queries.api import table, commit
 
-from tests.common import TEST_MYSQL_CONN_STRING, get_conn, random_table_suffix, DiffTestCase
+from tests.common import (
+    TEST_MYSQL_CONN_STRING,
+    TEST_POSTGRESQL_CONN_STRING,
+    get_conn,
+    random_table_suffix,
+    DiffTestCase,
+    drop_table,
+)
 
 
 class TestApi(DiffTestCase):
@@ -77,3 +87,52 @@ class TestApi(DiffTestCase):
         self.assertEqual(expected_dict, output)
         self.assertIsNotNone(diff)
         assert len(list(diff)) == 1
+
+
+class TestDerivedThreadPool(unittest.TestCase):
+    """diff_tables() runs both sides, and several segments, at once unless it's told otherwise."""
+
+    def test_pool_size_follows_the_thread_counts(self):
+        def segment(thread_count):
+            return SimpleNamespace(database=SimpleNamespace(thread_count=thread_count))
+
+        self.assertEqual(2, derived_threadpool_size(segment(1), segment(1)))
+        self.assertEqual(8, derived_threadpool_size(segment(4), segment(2)))
+        # A database without its own pool, such as DuckDB
+        self.assertEqual(2, derived_threadpool_size(SimpleNamespace(database=SimpleNamespace()), segment(1)))
+
+    def test_same_differences_as_one_query_at_a_time(self):
+        suffix = random_table_suffix()
+        rows = [(i, f"value {i}") for i in range(1, 2001)]
+        changed = [(i, f"changed {i}") if i % 97 == 0 else (i, v) for i, v in rows if i % 251]
+        conns = {MySQL: get_conn(MySQL), PostgreSQL: get_conn(PostgreSQL)}
+        names = {MySQL: f"src{suffix}", PostgreSQL: f"dst{suffix}"}
+        for (cls, conn), data in zip(conns.items(), (rows, changed)):
+            t = table(names[cls], schema={"id": int, "v": str})
+            conn.query([t.create(), t.insert_rows(data), commit])
+        try:
+            uris = {MySQL: TEST_MYSQL_CONN_STRING, PostgreSQL: TEST_POSTGRESQL_CONN_STRING}
+            results = []
+            for pool in ({}, {"max_threadpool_size": 1}):
+                segments = [
+                    connect_to_table(uris[cls], names[cls], "id", thread_count=4, extra_columns=("v",))
+                    for cls in (MySQL, PostgreSQL)
+                ]
+                try:
+                    diff = list(
+                        diff_tables(
+                            *segments, algorithm=Algorithm.HASHDIFF, bisection_factor=4, bisection_threshold=64, **pool
+                        )
+                    )
+                finally:
+                    # An open PostgreSQL transaction would block DROP TABLE
+                    for s in segments:
+                        s.database.close()
+                results.append(diff)
+            self.assertEqual(sorted(results[0]), sorted(results[1]))
+            removed = 2000 // 251
+            updated = len([i for i, _ in rows if i % 97 == 0 and i % 251])
+            self.assertEqual(removed + 2 * updated, len(results[0]))
+        finally:
+            for cls, conn in conns.items():
+                drop_table(conn, (names[cls],))

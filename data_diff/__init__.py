@@ -11,6 +11,9 @@ from data_diff.joindiff_tables import JoinDiffer, TABLE_WRITE_LIMIT
 from data_diff.table_segment import TableSegment
 from data_diff.utils import eval_name_template, Vector
 
+# The default of diff_tables(max_threadpool_size=...): derived from the databases' thread counts
+DERIVED_THREADPOOL_SIZE = "derived"
+
 
 def connect_to_table(
     db_info: Union[str, dict],
@@ -41,6 +44,16 @@ def connect_to_table(
     return TableSegment(db, table_name, key_columns, **kwargs)
 
 
+def derived_threadpool_size(table1: TableSegment, table2: TableSegment) -> int:
+    """Twice the larger thread_count of the two databases, and at least 2, as the CLI uses.
+
+    One thread per database is enough for the two sides of a segment to run at once. The rest
+    lets several segments run at once, as many as the databases have connections for.
+    """
+    thread_counts = [getattr(t.database, "thread_count", 1) or 1 for t in (table1, table2)]
+    return max(2, 2 * max(thread_counts))
+
+
 def diff_tables(
     table1: TableSegment,
     table2: TableSegment,
@@ -61,7 +74,8 @@ def diff_tables(
     threaded: bool = True,
     # Maximum size of each threadpool. None = auto. Only relevant when threaded is True.
     # There may be many pools, so number of actual threads can be a lot higher.
-    max_threadpool_size: Optional[int] = 1,
+    # By default, twice the larger thread_count of the two databases, as the CLI uses.
+    max_threadpool_size: Union[int, None, str] = DERIVED_THREADPOOL_SIZE,
     # Algorithm
     algorithm: Algorithm = Algorithm.AUTO,
     # An additional 'where' expression to restrict the search space.
@@ -98,6 +112,10 @@ def diff_tables(
         max_threadpool_size (int): Maximum size of each threadpool. ``None`` means auto.
                                    Only relevant when `threaded` is ``True``.
                                    There may be many pools, so number of actual threads can be a lot higher.
+                                   By default it's twice the larger ``thread_count`` of the two
+                                   databases, and at least 2, as the CLI does. So both tables are
+                                   queried at once, and several segments too. Pass 1 to run one
+                                   query at a time, which was the default before.
         where (str, optional): An additional 'where' expression to restrict the search space.
         algorithm (:class:`Algorithm`): Which diffing algorithm to use (`HASHDIFF`, `JOINDIFF` or `ROWHASH`. Default=`AUTO`).
                                        `ROWHASH` reads each table once, and is the one to use for large text
@@ -151,6 +169,9 @@ def diff_tables(
     }
 
     segments = [t.new(**override_attrs) for t in tables] if override_attrs else tables
+
+    if max_threadpool_size == DERIVED_THREADPOOL_SIZE:
+        max_threadpool_size = derived_threadpool_size(table1, table2)
 
     algorithm = Algorithm(algorithm)
     if algorithm == Algorithm.AUTO:
