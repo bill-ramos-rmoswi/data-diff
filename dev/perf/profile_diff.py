@@ -26,8 +26,31 @@ import time
 sys.path.insert(0, os.path.dirname(__file__))
 
 import run_perf  # noqa: E402  reads DATADIFF_*_URI, like run_perf.py itself
+from data_diff import connect_to_table, diff_tables  # noqa: E402
+from data_diff.hashdiff_tables import DEFAULT_BISECTION_FACTOR, DEFAULT_BISECTION_THRESHOLD  # noqa: E402
 from data_diff.queries.api import commit  # noqa: E402
 from data_diff.table_segment import TableSegment  # noqa: E402
+
+# Table shapes. fact_* is run_perf.py's. oltp_order_line is seeded by the tuning run's seed_oltp.py.
+# "where" is the predicate of the rows the updated scenario changes (about 0.016% of the table), which
+# never needs a dialect-specific operator.
+SHAPES = {
+    "fact": dict(
+        key=run_perf.KEY_COLUMNS,
+        extra=run_perf.EXTRA_COLUMNS,
+        update="UnitCost",
+        where=lambda q: f"{q('DateKey')} = 20130615 AND {q('ProductKey')} IN ({run_perf.PRODUCT_KEYS})",
+    ),
+    "oltp": dict(
+        key=("OrderId", "LineNumber"),
+        extra=(
+            "ProductCode", "ProductName", "CustomerName", "Comment", "TrackingNumber", "Quantity", "UnitPrice",
+            "Discount", "LineTotal", "OrderDate", "ShipDate", "ModifiedDate",
+        ),
+        update="Quantity",
+        where=lambda q: f"{q('LineNumber')} = 1 AND {q('OrderId')} IN ({', '.join(str(i) for i in range(3000, 500000, 3000))})",
+    ),
+}  # fmt: skip
 
 CATEGORIES = {
     "count_and_checksum": "checksum",
@@ -91,6 +114,9 @@ def main():
     p.add_argument("source")
     p.add_argument("target")
     p.add_argument("table", nargs="?", default="fact_2x")
+    p.add_argument("--shape", choices=list(SHAPES), help="default: oltp for oltp_* tables, else fact")
+    p.add_argument("--bisection-factor", type=int, default=DEFAULT_BISECTION_FACTOR)
+    p.add_argument("--bisection-threshold", type=int, default=DEFAULT_BISECTION_THRESHOLD)
     p.add_argument("--scenario", choices=["identical", "updated"], default="identical")
     p.add_argument("--json", help="Also write the result to this file")
     args = p.parse_args()
@@ -99,17 +125,37 @@ def main():
         if hasattr(TableSegment, method_name):
             _wrap(method_name, category)
 
+    shape = SHAPES[args.shape or ("oltp" if args.table.startswith("oltp_") else "fact")]
     conn = run_perf.connect(run_perf.URIS[args.target], shared=False)
     table_sql = conn.dialect.quote(args.table)
-    where = run_perf.changed_rows(conn, table_sql).split(" WHERE ")[1]
-    cost = conn.dialect.quote("UnitCost")
+    where = shape["where"](conn.dialect.quote)
+    cost = conn.dialect.quote(shape["update"])
     if args.scenario == "updated":
         conn.query(f"UPDATE {table_sql} SET {cost} = {cost} + 1 WHERE {where}", None)
         conn.query(commit)
     try:
+        tables = [
+            connect_to_table(
+                run_perf.URIS[name],
+                args.table,
+                shape["key"],
+                thread_count=run_perf.THREADS,
+                extra_columns=shape["extra"],
+            )
+            for name in (args.source, args.target)
+        ]
         start = time.monotonic()
-        diff, _ = run_perf.run_diff(args.source, args.target, args.table)
+        result_iter = diff_tables(
+            *tables,
+            algorithm=run_perf.ALGORITHM,
+            bisection_factor=args.bisection_factor,
+            bisection_threshold=args.bisection_threshold,
+        )
+        diff = list(result_iter)
         wall = time.monotonic() - start
+        rows_downloaded = result_iter.stats.get("rows_downloaded", 0)
+        for segment in tables:
+            segment.database.close()
     finally:
         if args.scenario == "updated":
             conn.query(f"UPDATE {table_sql} SET {cost} = {cost} - 1 WHERE {where}", None)
@@ -125,10 +171,16 @@ def main():
         algorithm=run_perf.ALGORITHM,
         threads=run_perf.THREADS,
         diff_lines=len(diff),
+        bisection_factor=args.bisection_factor,
+        bisection_threshold=args.bisection_threshold,
+        rows_downloaded=rows_downloaded,
+        checksum_queries=sum(c["calls"] for c in result["categories"] if c["category"] == "checksum"),
     )
     print(
         f"{args.source} -> {args.target} {args.table} {args.scenario} {run_perf.ALGORITHM}: "
-        f"{wall:.1f}s wall, {len(diff)} diff lines, {run_perf.THREADS} threads"
+        f"{wall:.1f}s wall, {len(diff)} diff lines, {run_perf.THREADS} threads, bisection factor "
+        f"{args.bisection_factor} threshold {args.bisection_threshold}: {result['checksum_queries']} checksum queries "
+        f"(2 per segment), {rows_downloaded} rows downloaded"
     )
     print(f"  {'step':<16} {'calls':>6} {'summed s':>9} {'wall s':>8} {'wall %':>7}")
     for row in result["categories"]:
