@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, ClassVar, Dict, Optional, Type
+from typing import Any, ClassVar, Dict, Optional, Sequence, Tuple, Type, Union
 
 import attrs
 
@@ -14,6 +14,7 @@ from data_diff.databases.base import (
     BaseDialect,
     Compiler,
 )
+from data_diff.schema import RawColumnInfo
 from data_diff.abcs.database_types import (
     JSON,
     Binary,
@@ -37,8 +38,17 @@ from data_diff.abcs.database_types import (
     Time,
 )
 from data_diff.queries.ast_classes import Code, Concat, CreateTable, Expr
-from data_diff.queries.extras import NormalizeAsString
+from data_diff.queries.extras import Checksum, NormalizeAsString, RowHash
 from data_diff.utils import BINARY_DIGEST_CHUNK, TEXT_DIGEST_CHUNK, join_iter
+
+# NVARCHAR(n) and VARCHAR(n) take at most 4000 and 8000. A text column declared longer, or MAX, is
+# converted to NVARCHAR(MAX) as before.
+MAX_BOUNDED_TEXT = 4000
+# The longest hash input, in UTF-16 code units, that's converted to UTF-8 without MAX types. UTF-8
+# takes at most 3 bytes per code unit (a surrogate pair is 2 units and 4 bytes), and VARCHAR(n) at
+# most 8000 bytes. Past this, CONVERT(VARCHAR(3n), ...) would truncate without an error.
+MAX_BOUNDED_HASH_INPUT = 2666
+NULL_TEXT = "<null>"
 
 
 @import_helper("mssql")
@@ -100,6 +110,14 @@ class Dialect(BaseDialect):
         # Same reduction as PostgreSQL, so a REAL and a DOUBLE PRECISION holding
         # the same number compare equal despite their binary rounding.
         return max(super()._convert_db_precision_to_digits(p) - 2, 0)
+
+    def parse_type(self, table_path: DbPath, info: RawColumnInfo) -> ColType:
+        coltype = super().parse_type(table_path, info)
+        length = info.character_maximum_length
+        # -1 is MAX, and TEXT, NTEXT and XML report 2^30 or more
+        if isinstance(coltype, StringType) and length is not None and 0 < length <= MAX_BOUNDED_TEXT:
+            return attrs.evolve(coltype, max_length=length)
+        return coltype
 
     def key_range_expr(self, column: Expr, coltype: Optional[ColType]) -> Expr:
         if isinstance(coltype, Native_UUID):
@@ -226,7 +244,76 @@ class Dialect(BaseDialect):
         # NVARCHAR(MAX) makes checksums about 3 times slower, so only text pays for it
         if isinstance(coltype, Integer):
             return f"CONVERT(VARCHAR(50), {value})"
+        if self._bounded_text(coltype):
+            # A VARCHAR(n) or NVARCHAR(n) column holds at most n UTF-16 code units, so this keeps the
+            # whole value, and is much faster to concatenate and hash than NVARCHAR(MAX)
+            return f"CONVERT(NVARCHAR({coltype.max_length}), {value})"
         return super().normalize_value_by_type(value, coltype)
+
+    @staticmethod
+    def _bounded_text(coltype: ColType) -> bool:
+        """Whether a text column is normalized to NVARCHAR(max_length) instead of NVARCHAR(MAX)."""
+        return (
+            isinstance(coltype, StringType)
+            and not isinstance(coltype, ColType_UUID)
+            and getattr(coltype, "digest", None) is None
+            and coltype.max_length is not None
+        )
+
+    def _normalized_bound(self, coltype: Optional[ColType]) -> Optional[Tuple[int, bool]]:
+        """The longest value normalize_value_by_type() returns for the type, in UTF-16 code units, and
+        whether it's VARCHAR holding only ASCII. None when there's no bound, or it isn't known."""
+        if coltype is None or getattr(coltype, "digest", None) is not None:
+            return None
+        if isinstance(coltype, (Integer, FractionalType)):
+            return 50, True  # CONVERT(VARCHAR(50), ...) of digits, '-' and '.'
+        if isinstance(coltype, TemporalType):
+            return 27, True  # VARCHAR(27) or shorter, of digits, '-', ':', '.' and ' '
+        if isinstance(coltype, Native_UUID):
+            return 36, True
+        if isinstance(coltype, StringType) and coltype.max_length is not None:
+            # NVARCHAR(n), or TRIM() of the column for a UUID kept as text
+            return coltype.max_length, False
+        return None
+
+    def _hash_input_bound(self, exprs: Sequence[Expr]) -> Optional[Tuple[int, bool]]:
+        """The bound of the text render_rowhash() hashes, as _normalized_bound() gives it."""
+        total, ascii_only = len(exprs) - 1, True  # the separators
+        for expr in exprs:
+            if not isinstance(expr, NormalizeAsString):
+                return None
+            bound = self._normalized_bound(expr.expr_type or expr.expr.type)
+            if bound is None:
+                return None
+            units, ascii_value = bound
+            total += max(units, len(NULL_TEXT)) if len(exprs) > 1 else units
+            ascii_only = ascii_only and ascii_value
+        return total, ascii_only
+
+    def render_rowhash(self, c: Compiler, elem: Union[Checksum, RowHash]) -> str:
+        if self._prevent_overflow_when_concat:
+            return super().render_rowhash(c, elem)
+
+        items = [self.compile(c, expr) for expr in elem.exprs]
+        bound = self._hash_input_bound(elem.exprs)
+        if len(items) > 1:
+            items = [f"coalesce({item}, '{NULL_TEXT}')" for item in items]
+            if bound is None or bound[0] > MAX_BOUNDED_HASH_INPUT:
+                # CONCAT truncates to 4000 UTF-16 code units unless an argument is a MAX type, which
+                # every text value was before columns got NVARCHAR(n)
+                items[0] = f"CONVERT(NVARCHAR(MAX), {items[0]})"
+            text = self.concat(list(join_iter("'|'", items)))
+        else:
+            (text,) = items
+
+        if bound is None or bound[0] > MAX_BOUNDED_HASH_INPUT:
+            return self._md5_bytes_as_int(self._hash_md5(text))
+        units, ascii_only = bound
+        if ascii_only:
+            # ASCII is the same in UTF-8 and every code page, so the VARCHAR bytes are already UTF-8
+            return self._md5_bytes_as_int(f"HASHBYTES('MD5', {text})")
+        utf8 = f"CONVERT(VARCHAR({3 * units}), CONVERT(NVARCHAR({units}), {text}) COLLATE Latin1_General_100_BIN2_UTF8)"
+        return self._md5_bytes_as_int(f"HASHBYTES('MD5', {utf8})")
 
     def render_concat(self, c: Compiler, elem: Concat) -> str:
         if self._prevent_overflow_when_concat:
@@ -252,11 +339,14 @@ class Dialect(BaseDialect):
         return f"HASHBYTES('MD5', {utf8})"
 
     def md5_as_int(self, s: str) -> str:
-        hex_digest = f"CONVERT(VARCHAR(32), {self._hash_md5(s)}, 2)"
-        return (
-            f"CONVERT(BIGINT, CONVERT(VARBINARY(8), '0x' + RIGHT({hex_digest}, {CHECKSUM_HEXDIGITS}), 1))"
-            f" - {CHECKSUM_OFFSET}"
-        )
+        return self._md5_bytes_as_int(self._hash_md5(s))
+
+    @staticmethod
+    def _md5_bytes_as_int(md5: str) -> str:
+        # The last CHECKSUM_HEXDIGITS hex digits of the MD5, as an unsigned integer: the same value
+        # as reading them from the hex digest, without the round trip through text
+        n = CHECKSUM_HEXDIGITS // 2
+        return f"CONVERT(BIGINT, SUBSTRING({md5}, {16 - n + 1}, {n})) - {CHECKSUM_OFFSET}"
 
     def md5_as_hex(self, s: str) -> str:
         return f"LOWER(CONVERT(VARCHAR(32), {self._hash_md5(s)}, 2))"
@@ -358,10 +448,37 @@ class MsSQL(ThreadedDatabase):
             info_schema_path.insert(0, self.dialect.quote(database))
 
         return (
-            "SELECT COLUMN_NAME, DATA_TYPE, DATETIME_PRECISION, NUMERIC_PRECISION, NUMERIC_SCALE, COLLATION_NAME "
+            "SELECT COLUMN_NAME, DATA_TYPE, DATETIME_PRECISION, NUMERIC_PRECISION, NUMERIC_SCALE, COLLATION_NAME, "
+            "CHARACTER_MAXIMUM_LENGTH "
             f"FROM {'.'.join(info_schema_path)} "
             f"WHERE TABLE_NAME = '{name}' AND TABLE_SCHEMA = '{schema}'"
         )
+
+    def query_table_schema(self, path: DbPath) -> Dict[str, RawColumnInfo]:
+        rows = self.query(self.select_table_schema(path), list, log_message=path)
+        if not rows:
+            raise RuntimeError(f"{self.name}: Table '{'.'.join(path)}' does not exist, or has no columns")
+        return {
+            r[0]: RawColumnInfo(
+                column_name=r[0],
+                data_type=r[1],
+                datetime_precision=r[2],
+                numeric_precision=r[3],
+                numeric_scale=r[4],
+                collation_name=r[5],
+                character_maximum_length=r[6],
+            )
+            for r in rows
+        }
+
+    def _refine_coltypes(self, table_path: DbPath, col_dict: Dict[str, ColType], where=None, sample_size=64):
+        # Sampling may turn a text column into a UUID or alphanumeric type, which keeps its length
+        lengths = {name: t.max_length for name, t in col_dict.items() if isinstance(t, StringType) and t.max_length}
+        super()._refine_coltypes(table_path, col_dict, where, sample_size)
+        for name, length in lengths.items():
+            if isinstance(col_dict[name], StringType) and col_dict[name].max_length is None:
+                col_dict[name] = attrs.evolve(col_dict[name], max_length=length)
+        return col_dict
 
     def _normalize_table_path(self, path: DbPath) -> DbPath:
         if len(path) == 1:

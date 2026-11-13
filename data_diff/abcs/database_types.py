@@ -205,6 +205,9 @@ class Decimal(FractionalType, IKey):  # Snowflake may use Decimal as a key
 class StringType(ColType):
     python_type = str
     collation: Optional[Collation] = attrs.field(default=None, kw_only=True)
+    # The declared length in UTF-16 code units, when the dialect knows it and can use it (SQL Server).
+    # None means unknown or unbounded. It doesn't take part in comparing types.
+    max_length: Optional[int] = attrs.field(default=None, kw_only=True, eq=False)
 
 
 class LongText(str):
