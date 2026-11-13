@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 import uuid
 import unittest
+import unittest.mock
 
 import attrs
 
@@ -914,3 +915,139 @@ class TestCompoundKeyAlphanum(DiffTestCase):
         self.assertEqual(diff, [("-", (uuid, "9", "9")), ("+", (uuid, "9000", "9"))])
 
         self.assertRaises(ValueError, list, differ.diff_tables(aa, a))
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHash(DiffTestCase):
+    """PostgreSQL and Db2 compare a small segment by the key and row hash of each row, and download
+    only the rows that differ. The result must be the same as comparing every row."""
+
+    src_schema = {"id": int, "c1": str, "c2": str}
+    dst_schema = {"id": int, "c1": str, "c2": str}
+
+    def segments(self):
+        return [
+            table_segment(self.connection, path, "id", extra_columns=("c1", "c2"), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+
+    def diff(self, rows1, rows2):
+        self.connection.query([self.src_table.insert_rows(rows1), self.dst_table.insert_rows(rows2), commit])
+        differ = HashDiffer(bisection_factor=2, bisection_threshold=100)
+        diff = list(differ.diff_tables(*self.segments()))
+        return diff, differ.stats
+
+    def test_equal_tables_report_nothing(self):
+        rows = [(i, f"v{i}", None if i % 3 else "<null>") for i in range(1, 21)]
+        diff, stats = self.diff(rows, rows)
+        self.assertEqual([], diff)
+        self.assertEqual(20, stats["rows_downloaded"])
+        self.assertEqual(0, stats["rows_fetched_by_key"])
+
+    def test_null_against_null_text_is_reported(self):
+        # Their row hashes are equal, and only the NULL mask tells them apart
+        rows1 = [(1, "a", None), (2, "b", "x"), (3, "c", "<null>"), (4, "d", None)]
+        rows2 = [(1, "a", "<null>"), (2, "b", "x"), (3, "c", None), (4, "d", None)]
+        diff, stats = self.diff(rows1, rows2)
+        expected = [
+            ("-", ("1", "a", None)),
+            ("+", ("1", "a", "<null>")),
+            ("-", ("3", "c", "<null>")),
+            ("+", ("3", "c", None)),
+        ]
+        self.assertEqual(expected, diff)
+        self.assertEqual(2, stats["rows_fetched_by_key"])
+
+    def test_differences_are_reported(self):
+        rows1 = [(i, f"v{i}", "same") for i in range(1, 31)]
+        rows2 = [(i, f"v{i}" if i % 7 else "changed", "same") for i in range(2, 32)]
+        diff, stats = self.diff(rows1, rows2)
+        changed = [i for i in range(2, 31) if i % 7 == 0]
+        expected = (
+            [("-", (str(i), f"v{i}", "same")) for i in [1] + changed]
+            + [("+", (str(i), "changed", "same")) for i in changed]
+            + [("+", ("31", "v31", "same"))]
+        )
+        self.assertEqual(sorted(expected), sorted(diff))
+        # The changed rows, and the rows only one side has, which are in different segments
+        self.assertEqual(len(changed) + 2, stats["rows_fetched_by_key"])
+
+    def test_segment_where_most_rows_differ_downloads_every_row(self):
+        # More suspects than one query fetches, and more than half the rows
+        patch = unittest.mock.patch("data_diff.hashdiff_tables.LEAF_KEY_BATCH", 5)
+        patch.start()
+        self.addCleanup(patch.stop)
+        rows1 = [(i, f"v{i}", "same") for i in range(1, 21)]
+        rows2 = [(i, f"v{i}" if i % 4 == 0 else "changed", "same") for i in range(1, 21)]
+        diff, stats = self.diff(rows1, rows2)
+        changed = [i for i in range(1, 21) if i % 4]
+        expected = [("-", (str(i), f"v{i}", "same")) for i in changed] + [
+            ("+", (str(i), "changed", "same")) for i in changed
+        ]
+        self.assertEqual(sorted(expected), sorted(diff))
+        self.assertEqual(0, stats.get("rows_fetched_by_key", 0))
+
+    def test_duplicate_keys_are_reported(self):
+        rows1 = [(1, "a", "x"), (2, "b", "x"), (2, "b", "x")]
+        rows2 = [(1, "a", "x"), (2, "b", "x")]
+        diff, _ = self.diff(rows1, rows2)
+        self.assertEqual([("-", ("2", "b", "x")), ("-", ("2", "b", "x")), ("+", ("2", "b", "x"))], diff)
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashTextUUIDKey(DiffTestCase):
+    """A text UUID key in mixed case can't be fetched by key, because the key's literal is in one
+    case. The segment must then download every row, not lose the rows it missed."""
+
+    src_schema = {"id": str, "v": int}
+    dst_schema = {"id": str, "v": int}
+
+    def test_mixed_case_keys_are_all_reported(self):
+        ids = [str(uuid.UUID(int=i * 7919 + 12345)) for i in range(30)]
+        ids = [u.upper() if i % 2 else u for i, u in enumerate(ids)]
+        rows1 = [(u, i) for i, u in enumerate(ids)]
+        rows2 = [(u, i + 1000 if i in (3, 4) else i) for i, u in enumerate(ids)]
+        self.connection.query([self.src_table.insert_rows(rows1), self.dst_table.insert_rows(rows2), commit])
+        segments = [
+            table_segment(self.connection, path, "id", extra_columns=("v",), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+        diff = list(HashDiffer(bisection_factor=2, bisection_threshold=100).diff_tables(*segments))
+        expected = [("-", (ids[i], str(i))) for i in (3, 4)] + [("+", (ids[i], str(i + 1000))) for i in (3, 4)]
+        self.assertEqual(sorted(expected), sorted(diff))
+
+    def test_key_that_isnt_a_uuid_is_reported(self):
+        # The sampled rows (the first 64) are UUIDs, so the key is a UUID type, and the last key
+        # can't be made into one. It sorts inside the key range, so it's in a leaf.
+        ids = [str(uuid.UUID(int=(i << 121) + i)) for i in range(1, 100)] + ["5zzz-not-a-uuid"]
+        rows1 = [(u, i) for i, u in enumerate(ids)]
+        rows2 = [(u, i + 1000 if u == ids[-1] else i) for i, u in enumerate(ids)]
+        for t, rows in ((self.src_table, rows1), (self.dst_table, rows2)):
+            for row in rows:  # one at a time, so the sample is the first rows inserted
+                self.connection.query(t.insert_row(*row))
+        self.connection.query(commit)
+        segments = [
+            table_segment(self.connection, path, "id", extra_columns=("v",), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+        diff = list(HashDiffer(bisection_factor=2, bisection_threshold=100).diff_tables(*segments))
+        self.assertEqual(sorted([("-", (ids[-1], "99")), ("+", (ids[-1], "1099"))]), sorted(diff))
+
+
+class TestLeafRowHashJSON(DiffTestCase):
+    db_cls = db.PostgreSQL
+
+    def test_json_with_different_spacing_isnt_reported(self):
+        for path, value in ((self.table_src_path, '{"a": 1}'), (self.table_dst_path, '{"a":1}')):
+            name = ".".join(path)
+            self.connection.query(f"CREATE TABLE {name} (id INT, j JSON)", None)
+            self.connection.query(f"INSERT INTO {name} VALUES (1, '{value}'), (2, '[1, 2]')", None)
+        self.connection.query(commit)
+        segments = [
+            table_segment(self.connection, path, "id", extra_columns=("j",), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+        differ = HashDiffer(bisection_factor=2, bisection_threshold=100)
+        self.assertEqual([], list(differ.diff_tables(*segments)))
+        # The row hashes differ, so the row is fetched, and diff_sets() finds the JSON equal
+        self.assertEqual(1, differ.stats["rows_fetched_by_key"])

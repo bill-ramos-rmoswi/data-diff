@@ -17,7 +17,8 @@ from data_diff.databases.postgresql import PostgresqlDialect
 from data_diff.databases.sybase import Dialect as SybaseDialect
 from data_diff.diff_tables import Algorithm
 from data_diff.hashdiff_tables import HashDiffer
-from data_diff.queries.api import commit, table
+from data_diff.queries.api import Count, commit, table, this
+from data_diff.queries.extras import Checksum, NormalizeAsString
 from data_diff.utils import ArithUUID, lob_digest
 from tests.common import CONN_STRINGS, get_conn, random_table_suffix
 
@@ -162,6 +163,17 @@ class TestPostgreSQLAgainstDb2(TypeTestCase):
         pg = self.table(db.PostgreSQL, "DOUBLE PRECISION", *values)
         db2 = self.table(db.Db2, "DOUBLE", *values)
         self.assert_both_directions((db.PostgreSQL, pg), (db.Db2, db2))
+
+    def test_leaf_tells_null_from_null_text(self):
+        # Both compare small segments by row hash, which is the same for NULL and '<null>'
+        pg_table = self.table(db.PostgreSQL, "VARCHAR(10)", "NULL", "'b'", "'<null>'")
+        db2_table = self.table(db.Db2, "VARCHAR(10)", "'<null>'", "'c'", "'<null>'")
+        self.assert_both_directions((db.PostgreSQL, pg_table), (db.Db2, db2_table), count=4)
+
+    def test_leaf_with_nulls_matches(self):
+        pg_table = self.table(db.PostgreSQL, "VARCHAR(10)", "NULL", "'b'", "'<null>'")
+        db2_table = self.table(db.Db2, "VARCHAR(10)", "NULL", "'b'", "'<null>'")
+        self.assert_both_directions((db.PostgreSQL, pg_table), (db.Db2, db2_table))
 
     def test_clob_within_the_hash_limit(self):
         text = "'" + "a" * 2000 + "'"
@@ -734,6 +746,102 @@ class TestLargeValuesMsSQLAgainstPostgreSQL(LargeValueCases, TypeTestCase):
         values = ["\U0001f600" * 5000 + "end", "日本" * 9000, "x" * 4095 + "\U0001f600" + "y" * 5000]
         a, b = self.tables("NVARCHAR(MAX)", "TEXT", values)
         self.assert_equal_with_both_algorithms(a, b)
+
+
+@requires(db.MsSQL, db.PostgreSQL)
+class TestMsSQLBoundedTextAgainstPostgreSQL(TypeTestCase):
+    """SQL Server hashes text declared up to 4000 long as NVARCHAR(n), without MAX types, when the
+    declared lengths prove the UTF-8 input fits, and as before otherwise. The checksums must equal
+    PostgreSQL's either way."""
+
+    def checksum_sql(self, ms_table, pg_table) -> str:
+        segments = [
+            connect_to_table(CONN_STRINGS[cls], name, ("id",), extra_columns=("v",), thread_count=2)
+            for cls, name in ((db.MsSQL, ms_table), (db.PostgreSQL, pg_table))
+        ]
+        try:
+            segments = [segment.with_schema() for segment in segments]
+            HashDiffer()._validate_and_adjust_columns(*segments)
+            ms_segment = segments[0]
+            query = ms_segment.make_select().select(
+                Count(), Checksum([NormalizeAsString(this[c]) for c in ("id", "v")])
+            )
+            return ms_segment.database.compile(query)
+        finally:
+            for segment in segments:
+                segment.database.close()
+
+    def test_nvarchar(self):
+        values = ["é", "漢", "\U0001f600", "ab  ", "", None, "<null>", "a|b", "mix é日\U0001f600z"]
+        a = self.table(db.MsSQL, "NVARCHAR(20)", *map(ms, values))
+        b = self.table(db.PostgreSQL, "TEXT", *map(pg, values))
+        sql = self.checksum_sql(a, b)
+        self.assertIn("CONVERT(NVARCHAR(20), [v])", sql)
+        self.assertNotIn("MAX", sql)
+        self.assert_matches((db.MsSQL, a), (db.PostgreSQL, b))
+
+    def test_varchar(self):
+        values = ["é", "ab  ", "", None, "x", "it's"]
+        a = self.table(db.MsSQL, "VARCHAR(10)", *map(pg, values))
+        b = self.table(db.PostgreSQL, "TEXT", *map(pg, values))
+        self.assertIn("CONVERT(NVARCHAR(10), [v])", self.checksum_sql(a, b))
+        self.assert_matches((db.MsSQL, a), (db.PostgreSQL, b))
+
+    def test_column_shorter_than_null_text(self):
+        # coalesce() must not cut '<null>' to the column's length
+        a = self.table(db.MsSQL, "VARCHAR(1)", "NULL", "'a'", "NULL")
+        b = self.table(db.PostgreSQL, "TEXT", "NULL", "'a'", "NULL")
+        self.assert_matches((db.MsSQL, a), (db.PostgreSQL, b))
+
+    def test_alphanumeric_text_keeps_its_length(self):
+        # Sampling turns this column into an alphanumeric type, which must keep the length
+        a = self.table(db.MsSQL, "VARCHAR(12)", "'abc123'", "'xyz789'")
+        b = self.table(db.PostgreSQL, "VARCHAR(12)", "'abc123'", "'xyz789'")
+        self.assertIn("CONVERT(NVARCHAR(12), [v])", self.checksum_sql(a, b))
+        self.assert_matches((db.MsSQL, a), (db.PostgreSQL, b))
+
+    def test_real_text_differences_are_reported(self):
+        a = self.table(db.MsSQL, "NVARCHAR(20)", *map(ms, ["漢a", "\U0001f600", "ab ", None, ""]))
+        b = self.table(db.PostgreSQL, "TEXT", *map(pg, ["漢b", "\U0001f601", "ab", "", " "]))
+        self.assert_both_directions((db.MsSQL, a), (db.PostgreSQL, b), count=10)
+
+    def test_text_near_the_bound(self):
+        # 2600 x 3 UTF-8 bytes, plus the key: inside VARCHAR(7998), so it's hashed without MAX types
+        a = self.table(db.MsSQL, "NVARCHAR(2600)", "REPLICATE(N'漢', 2600)", "REPLICATE(N'漢', 2599) + N'字'")
+        b = self.table(db.PostgreSQL, "TEXT", "repeat('漢', 2600)", "repeat('漢', 2600)")
+        sql = self.checksum_sql(a, b)
+        self.assertIn("CONVERT(NVARCHAR(2651)", sql)  # 50 for the key, the separator, and 2600
+        self.assertNotIn("MAX", sql)
+        diff = self.diff((db.MsSQL, a), (db.PostgreSQL, b))
+        self.assertEqual({"2"}, {row[0] for _, row in diff})
+        self.assertEqual(2, len(diff))
+        b_same = self.table(db.PostgreSQL, "TEXT", "repeat('漢', 2600)", "repeat('漢', 2599) || '字'", name="same")
+        self.assert_matches((db.MsSQL, a), (db.PostgreSQL, b_same))
+
+    def test_longer_declared_text_takes_the_max_path(self):
+        # 2667 x 漢 is 8001 UTF-8 bytes, which the bounded form would cut without an error
+        a = self.table(db.MsSQL, "NVARCHAR(3000)", "REPLICATE(N'漢', 2667)", "REPLICATE(N'漢', 2666) + N'字'")
+        b = self.table(db.PostgreSQL, "TEXT", "repeat('漢', 2667)", "repeat('漢', 2667)")
+        sql = self.checksum_sql(a, b)
+        self.assertIn("CONVERT(VARCHAR(MAX), CONVERT(NVARCHAR(MAX)", sql)
+        self.assertIn("CONVERT(NVARCHAR(MAX), coalesce(", sql)
+        diff = self.diff((db.MsSQL, a), (db.PostgreSQL, b))
+        self.assertEqual({"2"}, {row[0] for _, row in diff})
+        self.assertEqual(2, len(diff))
+
+    def test_non_text_is_hashed_without_conversion(self):
+        values = "9999999999999999999999999999999999.9999", "-0.5", "0", "NULL"
+        a = self.table(db.MsSQL, "DECIMAL(38, 4)", *values)
+        b = self.table(db.PostgreSQL, "DECIMAL(38, 4)", *values)
+        sql = self.checksum_sql(a, b)
+        self.assertNotIn("COLLATE", sql)
+        self.assertNotIn("NVARCHAR", sql)
+        self.assert_matches((db.MsSQL, a), (db.PostgreSQL, b))
+
+    def test_real_non_text_difference_is_reported(self):
+        a = self.table(db.MsSQL, "DECIMAL(38, 4)", "-0.5", "NULL")
+        b = self.table(db.PostgreSQL, "DECIMAL(38, 4)", "-0.4", "0")
+        self.assert_both_directions((db.MsSQL, a), (db.PostgreSQL, b), count=4)
 
 
 @requires(db.Db2, db.PostgreSQL)

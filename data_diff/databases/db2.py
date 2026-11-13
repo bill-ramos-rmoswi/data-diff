@@ -65,6 +65,9 @@ class Dialect(BaseDialect):
     ROUNDS_ON_PREC_LOSS = False
     # SELECT needs a FROM clause
     PLACEHOLDER_TABLE = "SYSIBM.SYSDUMMY1"
+    # Fetching rows through ibm_db_dbi is slow, about 9 times PostgreSQL's, and a key and a hash
+    # are much less to fetch than every normalized column
+    LEAF_ROW_HASH: ClassVar[bool] = True
     TYPE_CLASSES = {
         # Timestamps
         "TIMESTAMP": Timestamp,

@@ -1,7 +1,7 @@
 import os
 from numbers import Number
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, ClassVar, Collection, Dict, Iterator, List, Sequence, Set, Tuple
 
 import attrs
@@ -29,6 +29,11 @@ BENCHMARK = os.environ.get("BENCHMARK", False)
 
 DEFAULT_BISECTION_THRESHOLD = 1024 * 16
 DEFAULT_BISECTION_FACTOR = 32
+# Keys per query when a small segment downloads the rows whose hashes differ
+LEAF_KEY_BATCH = 500
+# Past this share of a segment's rows differing, fetching them by key costs more than downloading every
+# row: on a 15,000-row segment where every row differed, 2 to 4 times as much on PostgreSQL and Db2
+LEAF_MAX_SUSPECT_SHARE = 0.5
 
 logger = logging.getLogger("hashdiff_tables")
 
@@ -275,25 +280,13 @@ class HashDiffer(TableDiffer):
         # If count is below the threshold, just download and compare the columns locally
         # This saves time, as bisection speed is limited by ping and query performance.
         if self.bisection_disabled or max_rows < self.bisection_threshold or max_space_size < self.bisection_factor * 2:
+            if table1.database.dialect.LEAF_ROW_HASH and table2.database.dialect.LEAF_ROW_HASH:
+                diff = self._diff_leaf_by_row_hash(table1, table2, info_tree, level)
+                if diff is not None:
+                    return diff
+
             rows1, rows2 = self._threaded_call("get_values", [table1, table2])
-            json_cols = {
-                i: colname
-                for i, colname in enumerate(table1.extra_columns)
-                if isinstance(table1._schema[colname], JSON)
-            }
-            diff = list(
-                diff_sets(
-                    rows1,
-                    rows2,
-                    json_cols=json_cols,
-                    columns1=table1.relevant_columns,
-                    columns2=table2.relevant_columns,
-                    key_columns1=table1.key_columns,
-                    key_columns2=table2.key_columns,
-                    ignored_columns1=self.ignored_columns1,
-                    ignored_columns2=self.ignored_columns2,
-                )
-            )
+            diff = self._compare_rows(table1, table2, rows1, rows2)
 
             info_tree.info.set_diff(diff)
             info_tree.info.rowcounts = {1: len(rows1), 2: len(rows2)}
@@ -303,3 +296,91 @@ class HashDiffer(TableDiffer):
             return diff
 
         return super()._bisect_and_diff_segments(ti, table1, table2, info_tree, level, max_rows)
+
+    def _compare_rows(self, table1: TableSegment, table2: TableSegment, rows1: list, rows2: list) -> list:
+        "Compare rows as get_values() returns them, and return the differences"
+        json_cols = {
+            i: colname for i, colname in enumerate(table1.extra_columns) if isinstance(table1._schema[colname], JSON)
+        }
+        return list(
+            diff_sets(
+                rows1,
+                rows2,
+                json_cols=json_cols,
+                columns1=table1.relevant_columns,
+                columns2=table2.relevant_columns,
+                key_columns1=table1.key_columns,
+                key_columns2=table2.key_columns,
+                ignored_columns1=self.ignored_columns1,
+                ignored_columns2=self.ignored_columns2,
+            )
+        )
+
+    def _diff_leaf_by_row_hash(self, table1: TableSegment, table2: TableSegment, info_tree: InfoTree, level: int):
+        """Compare a small segment by the key, row hash and NULL mask of each row, then download
+        and compare only the rows that differ, by key. None when fetching by key doesn't return
+        exactly the rows those keys have, and the caller downloads every row instead.
+
+        The result is the same as comparing every row: a row whose hash and NULL mask match has
+        the same normalized values, unless 48 bits of MD5 collide, or text with '|' in it moves
+        between neighboring columns ('a|b', 'c' against 'a', 'b|c'). Checksums take both risks.
+        Rows that differ only in a way diff_sets() forgives, such as JSON spacing, are fetched and
+        then not reported.
+        """
+        hashes1, hashes2 = self._thread_map(lambda t: t.get_key_hashes(null_mask=True), [table1, table2])
+        key_size = len(table1.key_columns)
+        suspects = set()
+
+        def by_key(rows) -> dict:
+            found = {}
+            for row in rows:
+                key = tuple(row[:key_size])
+                # A duplicate key, or a value the database left for the client
+                if key in found or row[key_size + 1]:
+                    suspects.add(key)
+                found[key] = (int(row[key_size]), tuple(int(mask) for mask in row[key_size + 2 :]))
+            return found
+
+        by_key1, by_key2 = by_key(hashes1), by_key(hashes2)
+        suspects.update(key for key, value in by_key1.items() if by_key2.get(key) != value)
+        suspects.update(key for key in by_key2 if key not in by_key1)
+        del by_key1, by_key2
+        # A segment with few suspects fetches them in one query either way
+        if len(suspects) > max(LEAF_KEY_BATCH, LEAF_MAX_SUSPECT_SHARE * max(len(hashes1), len(hashes2))):
+            logger.info(". " * level + f"{len(suspects)} row hashes differ, so the segment downloads every row.")
+            return None
+
+        rows1, rows2 = [], []
+        keys = sorted(suspects)
+        try:
+            for start in range(0, len(keys), LEAF_KEY_BATCH):
+                batch = keys[start : start + LEAF_KEY_BATCH]
+                fetched1, fetched2 = self._thread_map(lambda t: t.get_rows_by_keys(batch), [table1, table2])
+                rows1 += fetched1
+                rows2 += fetched2
+        except ValueError as e:
+            # A key the key type can't take, such as a text key that isn't a UUID among ones that are,
+            # where the sampled rows were. Downloading every row doesn't parse the keys.
+            logger.info(". " * level + f"Fetching rows by key failed ({e}), so the segment downloads every row.")
+            return None
+
+        # A key selects its row only if the normalized key, made back into a value, equals the stored
+        # one. Where it doesn't (a text UUID key in mixed case, or with spaces around it), the row
+        # would be missed without a word, so the segment is compared by downloading every row.
+        def key_counts(rows, key_indices) -> Counter:
+            return Counter(key for key in (tuple(row[i] for i in key_indices) for row in rows) if key in suspects)
+
+        hash_keys = range(key_size)
+        for hashes, rows, table in ((hashes1, rows1, table1), (hashes2, rows2, table2)):
+            row_keys = [table.relevant_columns.index(c) for c in table.key_columns]
+            if key_counts(hashes, hash_keys) != Counter(tuple(row[i] for i in row_keys) for row in rows):
+                logger.info(". " * level + "Fetching rows by key missed some, so the segment downloads every row.")
+                return None
+        diff = self._compare_rows(table1, table2, rows1, rows2)
+
+        info_tree.info.set_diff(diff)
+        info_tree.info.rowcounts = {1: len(hashes1), 2: len(hashes2)}
+        logger.info(". " * level + f"Diff found {len(diff)} different rows, from {len(keys)} differing row hashes.")
+        self.stats["rows_downloaded"] = self.stats.get("rows_downloaded", 0) + max(len(hashes1), len(hashes2))
+        self.stats["rows_fetched_by_key"] = self.stats.get("rows_fetched_by_key", 0) + max(len(rows1), len(rows2))
+        return diff

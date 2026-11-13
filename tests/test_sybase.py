@@ -188,22 +188,26 @@ class TestSybaseConcurrency(unittest.TestCase):
                 admin.query(rows, None)
             admin.query(f"UPDATE {names[1]} SET v = U&'\\672C' WHERE id = 7", None)
 
+            # connect_to_table() shares one connection per URI, so it's closed only when both are done
+            opened = []
+
             def run(_):
                 segments = [
                     connect_to_table(CONN_STRINGS[db.Sybase], n, "id", thread_count=8, extra_columns=("v",))
                     for n in names
                 ]
-                try:
-                    return list(
-                        diff_tables(*segments, algorithm=Algorithm.HASHDIFF, bisection_factor=4, bisection_threshold=16)
-                    )
-                finally:
-                    for segment in segments:
-                        segment.database.close()
+                opened.extend(segments)
+                return list(
+                    diff_tables(*segments, algorithm=Algorithm.HASHDIFF, bisection_factor=4, bisection_threshold=16)
+                )
 
-            with ThreadPoolExecutor(2) as pool:
-                for result in pool.map(run, range(2)):
-                    self.assertEqual(2, len(result))
+            try:
+                with ThreadPoolExecutor(2) as pool:
+                    for result in pool.map(run, range(2)):
+                        self.assertEqual(2, len(result))
+            finally:
+                for segment in opened:
+                    segment.database.close()
         finally:
             for name in names:
                 admin.query(table(name).drop(if_exists=True))

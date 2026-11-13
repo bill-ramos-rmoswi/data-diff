@@ -12,8 +12,8 @@ from data_diff.databases.base import Database
 from data_diff.abcs.database_types import DbPath, DbKey, DbTime, IKey
 from data_diff.schema import RawColumnInfo, Schema, create_schema
 from data_diff.queries.extras import Checksum
-from data_diff.queries.api import Count, SKIP, table, this, Expr, min_, max_, Code, and_, or_, sum_
-from data_diff.queries.ast_classes import BinBoolOp, In, Select
+from data_diff.queries.api import Count, SKIP, table, this, Expr, min_, max_, Code, and_, or_, sum_, if_
+from data_diff.queries.ast_classes import BinBoolOp, BinOp, In, Select
 from data_diff.queries.extras import (
     ApplyFuncAndNormalizeAsString,
     DigestNeedsClient,
@@ -25,6 +25,10 @@ from data_diff.queries.extras import (
 logger = logging.getLogger("table_segment")
 
 RECOMMENDED_CHECKSUM_DURATION = 20
+
+
+# Columns per integer of get_key_hashes(null_mask=True), so the sum fits in a signed 64-bit integer
+NULL_MASK_BITS = 62
 
 
 def split_key_space(min_key: DbKey, max_key: DbKey, count: int) -> List[DbKey]:
@@ -197,17 +201,28 @@ class TableSegment:
         select = self.make_select().select(*fetched_cols)
         return self.database.query(select, List[Tuple])
 
-    def get_key_hashes(self) -> list:
+    def get_key_hashes(self, null_mask: bool = False) -> list:
         """Download the key and a hash of each row of the segment, in one pass.
 
         Each row is ``(*key, hash, needs_client)``. ``needs_client`` is 1 when the row has a large
         value that the database couldn't hash, so the hash doesn't cover it.
+
+        With ``null_mask``, each row ends with integers whose bits say which of the checked columns
+        that aren't keys are NULL, 62 columns to an integer. The hash can't tell NULL from the
+        text ``<null>``, and these can.
         """
         checked_columns = [c for c in self.relevant_columns if c not in self.ignored_columns]
+        masks = []
+        if null_mask:
+            columns = [c for c in checked_columns if c not in self.key_columns]
+            for start in range(0, len(columns), NULL_MASK_BITS):
+                chunk = columns[start : start + NULL_MASK_BITS]
+                masks.append(BinOp("+", [if_(this[c] == None, 1 << i, 0) for i, c in enumerate(chunk)]))  # noqa: E711
         select = self.make_select().select(
             *(NormalizeAsString(this[c]) for c in self.key_columns),
             RowHash([NormalizeAsString(this[c]) for c in checked_columns]),
             DigestNeedsClient([this[c] for c in checked_columns]),
+            *masks,
         )
         return self.database.query(select, List[Tuple])
 

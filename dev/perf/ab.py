@@ -3,11 +3,14 @@
     poetry run python dev/perf/ab.py --base origin/master fact_2x fact_13x
     poetry run python dev/perf/ab.py --base origin/master --runs 5 --out .runs/<run-id>/ab fact_13x
     poetry run python dev/perf/ab.py --base HEAD fact_2x       # A/A: measures the noise alone
+    poetry run python dev/perf/ab.py --base HEAD --shape oltp oltp_order_line
 
-The base runs from a git worktree under --out, with PYTHONPATH pointing at it. The head is
-the working tree you're in, uncommitted changes included. Runs alternate base, head, base,
-head..., so slow drift on the machine hits both sides alike. PERF_PAIRS, PERF_ALGORITHM,
-N_THREADS and SYBASE_CONFIG pass through to run_perf.py.
+The base's data_diff runs from a git worktree under --out, with PYTHONPATH pointing at it. The
+head is the working tree you're in, uncommitted changes included. Both sides run this tree's
+dev/perf/run_perf.py, so they time the same scenarios and checks, and a base older than a
+run_perf.py option (--shape, PERF_POOL) still works. Runs alternate base, head, base, head...,
+so slow drift on the machine hits both sides alike. --shape, PERF_PAIRS, PERF_ALGORITHM,
+PERF_POOL, N_THREADS and SYBASE_CONFIG pass through to run_perf.py.
 
 Progress goes to <out>/progress.log (dev/status.sh reads it). Each run's log and results are
 in <out>, and the summary is <out>/summary.md and summary.json.
@@ -101,6 +104,7 @@ def main():
     p.add_argument("--base", default="origin/master", help="Revision to compare against (default origin/master)")
     p.add_argument("--runs", type=int, default=5, help="Runs per side (default 5)")
     p.add_argument("--out", default=None, help="Output directory (default .runs/ab-<time>)")
+    p.add_argument("--shape", help="Table shape for run_perf.py (fact or oltp; default by table name)")
     args = p.parse_args()
 
     out = os.path.abspath(args.out or os.path.join(REPO, ".runs", f"ab-{datetime.now():%Y%m%d-%H%M%S}"))
@@ -113,6 +117,9 @@ def main():
     if not os.path.isdir(worktree):
         git("worktree", "add", "--detach", worktree, base_rev)
     rig_file = os.path.join(REPO, ".runs", "rig.json")
+    run_perf = [sys.executable, os.path.join(REPO, "dev", "perf", "run_perf.py"), *args.tables]
+    if args.shape:
+        run_perf += ["--shape", args.shape]
 
     sides = {"base": worktree, "head": REPO}
     results = {"base": defaultdict(list), "head": defaultdict(list)}
@@ -136,7 +143,7 @@ def main():
                 )
                 with open(os.path.join(out, f"{side}-{i}.log"), "w", encoding="utf-8") as run_log:
                     code = subprocess.call(
-                        [sys.executable, os.path.join(directory, "dev", "perf", "run_perf.py"), *args.tables],
+                        run_perf,
                         cwd=directory,
                         env=env,
                         stdout=run_log,

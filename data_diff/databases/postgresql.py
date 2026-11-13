@@ -53,6 +53,8 @@ class PostgresqlDialect(BaseDialect):
     ROUNDS_ON_PREC_LOSS = True
     SUPPORTS_PRIMARY_KEY: ClassVar[bool] = True
     SUPPORTS_INDEXES = True
+    # A key and a row hash are less to fetch than every normalized column
+    LEAF_ROW_HASH: ClassVar[bool] = True
 
     # https://www.postgresql.org/docs/current/datatype-numeric.html#DATATYPE-NUMERIC-DECIMAL
     # without any precision or scale creates an “unconstrained numeric” column

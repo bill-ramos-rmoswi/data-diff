@@ -26,6 +26,8 @@ class RawColumnInfo(Collection[Any]):
     numeric_precision: Optional[int] = None
     numeric_scale: Optional[int] = None
     collation_name: Optional[str] = None
+    # The declared length of a text column, where a database reports it and its dialect uses it
+    character_maximum_length: Optional[int] = None
 
     # It was a tuple once, so we keep it backward compatible temporarily, until remade to classes.
     def __iter__(self) -> Iterator[Any]:
