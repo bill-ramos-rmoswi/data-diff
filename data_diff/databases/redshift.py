@@ -36,6 +36,8 @@ class Dialect(PostgresqlDialect):
         "float": Float,  # Redshift Spectrum
     }
     SUPPORTS_INDEXES = False
+    # Not measured on Redshift, so hashdiff downloads the rows of small segments as before
+    LEAF_ROW_HASH: ClassVar[bool] = False
 
     def concat(self, items: List[str]) -> str:
         joined_exprs = " || ".join(items)

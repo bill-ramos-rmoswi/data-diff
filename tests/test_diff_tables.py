@@ -914,3 +914,84 @@ class TestCompoundKeyAlphanum(DiffTestCase):
         self.assertEqual(diff, [("-", (uuid, "9", "9")), ("+", (uuid, "9000", "9"))])
 
         self.assertRaises(ValueError, list, differ.diff_tables(aa, a))
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHash(DiffTestCase):
+    """PostgreSQL and Db2 compare a small segment by the key and row hash of each row, and download
+    only the rows that differ. The result must be the same as comparing every row."""
+
+    src_schema = {"id": int, "c1": str, "c2": str}
+    dst_schema = {"id": int, "c1": str, "c2": str}
+
+    def segments(self):
+        return [
+            table_segment(self.connection, path, "id", extra_columns=("c1", "c2"), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+
+    def diff(self, rows1, rows2):
+        self.connection.query([self.src_table.insert_rows(rows1), self.dst_table.insert_rows(rows2), commit])
+        differ = HashDiffer(bisection_factor=2, bisection_threshold=100)
+        diff = list(differ.diff_tables(*self.segments()))
+        return diff, differ.stats
+
+    def test_equal_tables_report_nothing(self):
+        rows = [(i, f"v{i}", None if i % 3 else "<null>") for i in range(1, 21)]
+        diff, stats = self.diff(rows, rows)
+        self.assertEqual([], diff)
+        self.assertEqual(20, stats["rows_downloaded"])
+        self.assertEqual(0, stats["rows_fetched_by_key"])
+
+    def test_null_against_null_text_is_reported(self):
+        # Their row hashes are equal, and only the NULL mask tells them apart
+        rows1 = [(1, "a", None), (2, "b", "x"), (3, "c", "<null>"), (4, "d", None)]
+        rows2 = [(1, "a", "<null>"), (2, "b", "x"), (3, "c", None), (4, "d", None)]
+        diff, stats = self.diff(rows1, rows2)
+        expected = [
+            ("-", ("1", "a", None)),
+            ("+", ("1", "a", "<null>")),
+            ("-", ("3", "c", "<null>")),
+            ("+", ("3", "c", None)),
+        ]
+        self.assertEqual(expected, diff)
+        self.assertEqual(2, stats["rows_fetched_by_key"])
+
+    def test_differences_are_reported(self):
+        rows1 = [(i, f"v{i}", "same") for i in range(1, 31)]
+        rows2 = [(i, f"v{i}" if i % 7 else "changed", "same") for i in range(2, 32)]
+        diff, stats = self.diff(rows1, rows2)
+        changed = [i for i in range(2, 31) if i % 7 == 0]
+        expected = (
+            [("-", (str(i), f"v{i}", "same")) for i in [1] + changed]
+            + [("+", (str(i), "changed", "same")) for i in changed]
+            + [("+", ("31", "v31", "same"))]
+        )
+        self.assertEqual(sorted(expected), sorted(diff))
+        # The changed rows, and the rows only one side has, which are in different segments
+        self.assertEqual(len(changed) + 2, stats["rows_fetched_by_key"])
+
+    def test_duplicate_keys_are_reported(self):
+        rows1 = [(1, "a", "x"), (2, "b", "x"), (2, "b", "x")]
+        rows2 = [(1, "a", "x"), (2, "b", "x")]
+        diff, _ = self.diff(rows1, rows2)
+        self.assertEqual([("-", ("2", "b", "x")), ("-", ("2", "b", "x")), ("+", ("2", "b", "x"))], diff)
+
+
+class TestLeafRowHashJSON(DiffTestCase):
+    db_cls = db.PostgreSQL
+
+    def test_json_with_different_spacing_isnt_reported(self):
+        for path, value in ((self.table_src_path, '{"a": 1}'), (self.table_dst_path, '{"a":1}')):
+            name = ".".join(path)
+            self.connection.query(f"CREATE TABLE {name} (id INT, j JSON)", None)
+            self.connection.query(f"INSERT INTO {name} VALUES (1, '{value}'), (2, '[1, 2]')", None)
+        self.connection.query(commit)
+        segments = [
+            table_segment(self.connection, path, "id", extra_columns=("j",), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+        differ = HashDiffer(bisection_factor=2, bisection_threshold=100)
+        self.assertEqual([], list(differ.diff_tables(*segments)))
+        # The row hashes differ, so the row is fetched, and diff_sets() finds the JSON equal
+        self.assertEqual(1, differ.stats["rows_fetched_by_key"])

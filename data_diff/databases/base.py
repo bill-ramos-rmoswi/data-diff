@@ -228,6 +228,9 @@ class BaseDialect(abc.ABC):
     PREVENT_OVERFLOW_WHEN_CONCAT: ClassVar[bool] = False
     TYPE_CLASSES: ClassVar[Dict[str, Type[ColType]]] = {}
     DEFAULT_NUMERIC_PRECISION: ClassVar[int] = 0  # effective precision when type is just "NUMERIC"
+    # Whether hashdiff compares a small segment by the key and row hash of each row, and downloads
+    # only the rows that differ, instead of every row. Only when both sides' dialects say so.
+    LEAF_ROW_HASH: ClassVar[bool] = False
 
     PLACEHOLDER_TABLE = None  # Used for Oracle
 

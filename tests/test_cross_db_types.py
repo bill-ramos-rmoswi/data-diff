@@ -164,6 +164,17 @@ class TestPostgreSQLAgainstDb2(TypeTestCase):
         db2 = self.table(db.Db2, "DOUBLE", *values)
         self.assert_both_directions((db.PostgreSQL, pg), (db.Db2, db2))
 
+    def test_leaf_tells_null_from_null_text(self):
+        # Both compare small segments by row hash, which is the same for NULL and '<null>'
+        pg_table = self.table(db.PostgreSQL, "VARCHAR(10)", "NULL", "'b'", "'<null>'")
+        db2_table = self.table(db.Db2, "VARCHAR(10)", "'<null>'", "'c'", "'<null>'")
+        self.assert_both_directions((db.PostgreSQL, pg_table), (db.Db2, db2_table), count=4)
+
+    def test_leaf_with_nulls_matches(self):
+        pg_table = self.table(db.PostgreSQL, "VARCHAR(10)", "NULL", "'b'", "'<null>'")
+        db2_table = self.table(db.Db2, "VARCHAR(10)", "NULL", "'b'", "'<null>'")
+        self.assert_both_directions((db.PostgreSQL, pg_table), (db.Db2, db2_table))
+
     def test_clob_within_the_hash_limit(self):
         text = "'" + "a" * 2000 + "'"
         pg = self.table(db.PostgreSQL, "TEXT", text)
