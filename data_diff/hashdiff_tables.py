@@ -345,11 +345,17 @@ class HashDiffer(TableDiffer):
 
         rows1, rows2 = [], []
         keys = sorted(suspects)
-        for start in range(0, len(keys), LEAF_KEY_BATCH):
-            batch = keys[start : start + LEAF_KEY_BATCH]
-            fetched1, fetched2 = self._thread_map(lambda t: t.get_rows_by_keys(batch), [table1, table2])
-            rows1 += fetched1
-            rows2 += fetched2
+        try:
+            for start in range(0, len(keys), LEAF_KEY_BATCH):
+                batch = keys[start : start + LEAF_KEY_BATCH]
+                fetched1, fetched2 = self._thread_map(lambda t: t.get_rows_by_keys(batch), [table1, table2])
+                rows1 += fetched1
+                rows2 += fetched2
+        except ValueError as e:
+            # A key the key type can't take, such as a text key that isn't a UUID among ones that are,
+            # where the sampled rows were. Downloading every row doesn't parse the keys.
+            logger.info(". " * level + f"Fetching rows by key failed ({e}), so the segment downloads every row.")
+            return None
 
         # A key selects its row only if the normalized key, made back into a value, equals the stored
         # one. Where it doesn't (a text UUID key in mixed case, or with spaces around it), the row

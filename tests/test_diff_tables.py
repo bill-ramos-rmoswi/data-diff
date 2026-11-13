@@ -1000,6 +1000,23 @@ class TestLeafRowHashTextUUIDKey(DiffTestCase):
         expected = [("-", (ids[i], str(i))) for i in (3, 4)] + [("+", (ids[i], str(i + 1000))) for i in (3, 4)]
         self.assertEqual(sorted(expected), sorted(diff))
 
+    def test_key_that_isnt_a_uuid_is_reported(self):
+        # The sampled rows (the first 64) are UUIDs, so the key is a UUID type, and the last key
+        # can't be made into one. It sorts inside the key range, so it's in a leaf.
+        ids = [str(uuid.UUID(int=(i << 121) + i)) for i in range(1, 100)] + ["5zzz-not-a-uuid"]
+        rows1 = [(u, i) for i, u in enumerate(ids)]
+        rows2 = [(u, i + 1000 if u == ids[-1] else i) for i, u in enumerate(ids)]
+        for t, rows in ((self.src_table, rows1), (self.dst_table, rows2)):
+            for row in rows:  # one at a time, so the sample is the first rows inserted
+                self.connection.query(t.insert_row(*row))
+        self.connection.query(commit)
+        segments = [
+            table_segment(self.connection, path, "id", extra_columns=("v",), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+        diff = list(HashDiffer(bisection_factor=2, bisection_threshold=100).diff_tables(*segments))
+        self.assertEqual(sorted([("-", (ids[-1], "99")), ("+", (ids[-1], "1099"))]), sorted(diff))
+
 
 class TestLeafRowHashJSON(DiffTestCase):
     db_cls = db.PostgreSQL
