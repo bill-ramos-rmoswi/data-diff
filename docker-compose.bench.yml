@@ -1,0 +1,54 @@
+# Matched resources for benchmarks. Layer it on the main file, from WSL:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --wait postgres mssql db2
+#   docker compose -f docker-compose.yml -f docker-compose.bench.yml --profile ase up -d --wait ase
+#
+# Then, in the devcontainer, `poetry run python dev/bench/rig.py apply` sets each engine to use
+# what it's given, and `rig.py check` reads it back and measures the noise. Without this file,
+# the stack keeps its everyday settings, which differ per database (see docker-compose.yml).
+#
+# Every database gets 4 GB and 4 vCPUs. `cpuset` pins the vCPUs, so an engine sees 4 CPUs,
+# instead of a time quota on all 16 (`cpus:` alone), where SQL Server started 16 workers and
+# thrashed: MAXDOP 0 took 47 s, MAXDOP 4 took 14.6 s for the same query.
+#
+# The source databases share vCPUs 0-3, and PostgreSQL has 4-7, because a benchmark runs one
+# pair at a time. MySQL has 8-9, and the devcontainer, which runs data-diff itself, keeps 8-15.
+# WSL's vCPUs are scheduled by Hyper-V onto P or E cores of the hybrid CPU, which pinning can't
+# control, so `rig.py check` measures the noise that remains instead of assuming it's gone.
+services:
+  postgres:
+    cpus: 4
+    cpuset: "4-7"
+    mem_limit: 4g
+    # The buffer cache is about half of the container on every database
+    command: >
+      -c shared_buffers=2GB
+      -c effective_cache_size=3GB
+      -c work_mem=128MB
+      -c maintenance_work_mem=512MB
+      -c max_wal_size=8GB
+      -c max_worker_processes=8
+      -c max_parallel_workers=4
+      -c max_parallel_workers_per_gather=4
+
+  mssql:
+    cpus: 4
+    cpuset: "0-3"
+    mem_limit: 4g
+    environment:
+      # mssql-conf memory.memorylimitmb. rig.py sets max server memory and MAXDOP inside it.
+      MSSQL_MEMORY_LIMIT_MB: "3584"
+
+  db2:
+    cpus: 4
+    cpuset: "0-3"
+    mem_limit: 4g
+
+  ase:
+    cpus: 4
+    cpuset: "0-3"
+    mem_limit: 4g
+
+  mysql:
+    cpus: 2
+    cpuset: "8-9"

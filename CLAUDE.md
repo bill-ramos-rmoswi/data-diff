@@ -52,6 +52,16 @@ poetry run python3 -m data_diff <db1_uri> <table1> <db2_uri> <table2> --verbose
 - `CONTRIBUTING.md` still says `black -l 120`. CI uses `ruff format`.
 - `LOG_LEVEL=DEBUG` prints every query and the type detected for each column.
 
+## Long jobs
+
+On 11 November, a job looked stuck three times, and the user couldn't tell whether anything was running. These rules keep a job visible:
+
+- A foreground command must finish within 2 minutes. Anything longer runs with `run_in_background`, and you wait for its notification.
+- Never put `nohup` or a trailing `&` inside a background command. The launcher exits at once, its "completed" notice arrives before the work has run, and nothing reports when the work really ends.
+- A job longer than a few minutes writes timestamped `[i/N]` progress lines to a file. `run_perf.py` and `ab.py` already do, through `PERF_PROGRESS_FILE` and `<out>/progress.log`.
+- When you start one, say in one line what it is, how long it should take, and that `bash dev/status.sh` shows its progress. The user can run that in any terminal, and `/status` summarizes it.
+- Phased plans run with `/orchestrate`: one coordinator, a background agent per phase on the model the phase names, and `.runs/<run-id>/status.md` for the user to read. It interrupts only at a STOP or when done.
+
 ## Test configuration
 
 `tests/common.py` holds a `TEST_<DB>_CONN_STRING` for each database. Those with a `None` value are skipped silently, so a database that isn't configured looks like a passing run. Check the `Testing databases:` line printed at import.
@@ -79,11 +89,29 @@ poetry run python dev/perf/seed.py                       # about 1 minute
 poetry run python dev/perf/run_perf.py fact_2x fact_13x  # about 15 minutes, writes benchmark_<revision>.jsonl
 ```
 
-`run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB, and the ASE trial runs in a container.
+`run_perf.py` fails if data-diff doesn't report exactly the rows it changed. Results compare database pairs on one machine.
+
+### The matched rig
+
+Benchmark only on the matched rig, so that every database gets 4 pinned vCPUs and 4 GB, and is set to use them:
+
+```shell
+docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --wait postgres mssql db2     # in WSL
+docker compose -f docker-compose.yml -f docker-compose.bench.yml --profile ase up -d --wait ase
+poetry run python dev/bench/rig.py apply     # in the devcontainer. It may print a Db2 or ASE restart
+poetry run python dev/bench/rig.py check     # must end with "Rig: bench"; writes .runs/rig.json
+```
+
+- **Why.** The everyday `docker-compose.yml` gives each database a different memory limit (PostgreSQL 4 GB, SQL Server 6, Db2 10, ASE 2). Its `cpus: 4` is a time quota, so every engine sees all 16 CPUs. SQL Server then ran 16 workers on 4 CPUs of quota: one MD5 query on `fact_13x` took 47 s at the default MAXDOP 0, 14.6 s at MAXDOP 4 and 35.5 s at MAXDOP 16. The MsSQL numbers measured before the rig existed include that thrash.
+- **Settings stay** after `rig.py apply`: SQL Server's and Db2's in their volumes, and ASE's until its container is recreated. `rig.py apply --profile everyday` puts them back.
+- **Comparing revisions.** `dev/perf/ab.py --base <rev> --runs 5 <tables>` alternates the base revision (from a worktree) with the working tree, and its verdict counts a change only beyond twice the noise it measured. `--base HEAD` measures the noise alone.
+- **Before optimizing a step,** run `dev/perf/profile_diff.py <source> <target> <table>`. It splits a diff's wall time into checksum, key range, download and client-only time, and that share caps the gain. In the fewer-casts experiment, checksums got 8–16% faster, but full diffs only 0–5%.
+- **Timing one checksum alone:** `dev/perf/checksum.py`.
+- **What pinning can't control.** The host's Core Ultra 7 255H has P, E and LP-E cores, and Hyper-V can move WSL's vCPUs between them. `rig.py check --noise 5` measures what noise is left. They aren't production numbers, because Db2 Community Edition is limited to 4 cores and 16 GB, and the ASE trial runs in a container.
 
 With `DATADIFF_SYBASE_URI` set, `seed.py` also loads ASE, and `seed.py --only sybase` loads it from the CSVs a previous run exported. ASE has no server-side load, so `freebcp` sends the rows over TDS into `perfdb`, which has its own devices `perfdata` (2,500 MB) and `perflog` (1,000 MB) in `/opt/sap/data`. Measured `sp_spaceused`: `fact_2x` 61 MB, `fact_13x` 399 MB. The primary key is added after the load, and `seed.py` checks counts, sums and the data-diff checksum against PostgreSQL. `run_perf.py` adds ASE in both directions against the other three. `PERF_PAIRS=Sybase:PostgreSQL,...` runs only some pairs, `PERF_ALGORITHM=rowhash` times `RowHashDiffer`, and `SYBASE_CONFIG` labels the results.
 
-The 2 GB defaults are enough. The perf tables (460 MB) already fit in the 768 MB data cache, and a run at `ASE_MEM=4g` with `max memory` at 3.25 GB and a 2 GB data cache was no faster. Timings on this machine vary by about 20% from one run to the next, so repeat a pair before treating a difference of that size as real.
+The 2 GB defaults are enough for ASE on its own. The perf tables (460 MB) already fit in the 768 MB data cache, and a run at `ASE_MEM=4g` with `max memory` at 3.25 GB and a 2 GB data cache was no faster. The matched rig still gives it 4 GB, so that every database gets the same. Timings on the everyday stack vary by about 20% from one run to the next. Use the noise that `ab.py` measures instead of that figure.
 
 ## Database behavior that's easy to get wrong
 

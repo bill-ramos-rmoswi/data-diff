@@ -153,6 +153,9 @@ benchmark_*.png
 
 docker-compose-local.yml
 
+# Orchestrated runs, A/B benchmark output and the rig snapshot (dev/bench/rig.py)
+.runs/
+
 # Generated performance test data
 dev/perf/data/*
 !dev/perf/data/.gitkeep

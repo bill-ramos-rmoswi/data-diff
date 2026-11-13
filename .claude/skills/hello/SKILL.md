@@ -46,7 +46,9 @@ git log --oneline HEAD..origin/master | head
 - Uncommitted changes, stashes, or commits that aren't pushed: list them. They're probably from the last session.
 - If master has moved on and the current branch isn't master, say how many commits behind it is.
 - Open PRs and the latest CI runs: `gh pr list --repo bill-ramos-rmoswi/data-diff --author @me` and `gh run list --repo bill-ramos-rmoswi/data-diff --limit 5`. Report failed or running checks.
-- The `handoff` project memory written by `/shutting-down`: give its next step and the model it names. Also mention any other memories that describe work in progress.
+- The `handoff-*` project memories written by `/shutting-down` (and an old `handoff`, if any): give each one's next step and the model it names. Also mention any other memories that describe work in progress.
+- Run `bash dev/status.sh`. Report orchestrated runs in `.runs/` that haven't finished, and jobs still running.
+- If `.runs/rig.json` exists and doesn't say `"profile": "bench"`, note that the databases aren't on the matched benchmark rig. That only matters for benchmarks.
 
 ## 6. Report
 

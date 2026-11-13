@@ -24,26 +24,40 @@ poetry run python dev/probe.py sybase --perf "select count(*) from fact_13x"
 
 If a count is missing or wrong, seed: `poetry run python dev/perf/seed.py` (about 1 minute), or `--only sybase` for ASE alone.
 
-## 3. Run in the background
+## 3. Check the rig
+
+Numbers are comparable only on the matched rig: `docker-compose.bench.yml`, 4 vCPU and 4 GB per database. Without it, SQL Server ran 16 workers on a 4-CPU quota, which made its numbers up to 3 times too slow.
+
+```shell
+poetry run python dev/bench/rig.py check           # about 10 s. Must end with "Rig: bench"
+```
+
+If it doesn't, give the user the WSL commands from the top of `docker-compose.bench.yml`, then run `rig.py apply`, which may print a restart for Db2 or ASE. To measure the noise, run `rig.py check --noise 5`.
+
+## 4. Run in the background
+
+A comparison of two revisions:
 
 ```shell
 PERF_PAIRS=Db2:PostgreSQL,MsSQL:PostgreSQL,Sybase:PostgreSQL \
-  poetry run python dev/perf/run_perf.py fact_2x fact_13x > $SCRATCH/perf.log 2>&1
+  poetry run python dev/perf/ab.py --base origin/master --runs 5 fact_2x fact_13x > $SCRATCH/ab.log 2>&1
 ```
 
-- Run it with `run_in_background` and wait for the notification. Don't poll.
-- Options:
-  - `PERF_ALGORITHM=rowhash` times `RowHashDiffer`.
-  - `SYBASE_CONFIG="..."` labels the ASE settings.
-  - `N_THREADS` sets the thread count (default 4).
-- The results go to `benchmark_<revision>.jsonl`, which is untracked. Keep it out of commits unless the user asks.
+A single run: `poetry run python dev/perf/run_perf.py fact_2x fact_13x`, with the same `PERF_PAIRS`.
 
-## 4. Compare honestly
+- **Running it.** Use `run_in_background` with the command itself, never `nohup` or `&`, and wait for the notification. Don't poll.
+- **Saying what's running.** Tell the user what is running, how long it should take (about 10 minutes per run for those three pairs on both tables), and that `bash dev/status.sh` shows its `[i/N]` progress.
+- **Options.** `PERF_ALGORITHM=rowhash` times `RowHashDiffer`, `SYBASE_CONFIG="..."` labels the ASE settings, and `N_THREADS` sets the thread count (default 4).
+- **Before optimizing a step,** run `dev/perf/profile_diff.py` once on the pair. It shows that step's share of the wall time, which caps the gain.
+- **Results.** They go to `benchmark_<revision>.jsonl`, or to `ab.py`'s `--out` directory, and each row carries the rig from `.runs/rig.json`. These files are untracked, so keep them out of commits unless the user asks.
 
-- For a before and after comparison, run both on the same machine, at least twice, alternating. A gap under 20% isn't a result until it repeats.
-- Report a table: pair, table, scenario (identical, updated, deleted), median seconds, and the change in %.
-- Say what the numbers aren't: Db2 Community Edition is limited to 4 cores and 16 GB, and ASE is a trial in a container.
-- When you update the README, change only the pairs in scope, and give the revision the numbers came from.
+## 5. Compare honestly
+
+- **The noise rule.** Use `ab.py`'s verdict: a change counts only if it's more than twice the noise measured in the same comparison. A fixed 20% doesn't count, and neither does a single run.
+- **An A/A run** (`--base HEAD`) measures the noise alone. Run one when the rig changed.
+- **Report a table:** pair, table, scenario (identical, updated, deleted), median seconds, change in %, noise and verdict.
+- **Say what the numbers aren't.** Db2 Community Edition is limited to 4 cores and 16 GB, ASE is a trial in a container, and WSL's vCPUs move between P and E cores.
+- **README updates.** Change only the pairs in scope, and give the revision and the rig the numbers came from.
 
 ## Examples
 
