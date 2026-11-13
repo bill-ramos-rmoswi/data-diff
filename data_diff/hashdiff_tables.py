@@ -1,7 +1,7 @@
 import os
 from numbers import Number
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, ClassVar, Collection, Dict, Iterator, List, Sequence, Set, Tuple
 
 import attrs
@@ -278,7 +278,9 @@ class HashDiffer(TableDiffer):
         # This saves time, as bisection speed is limited by ping and query performance.
         if self.bisection_disabled or max_rows < self.bisection_threshold or max_space_size < self.bisection_factor * 2:
             if table1.database.dialect.LEAF_ROW_HASH and table2.database.dialect.LEAF_ROW_HASH:
-                return self._diff_leaf_by_row_hash(table1, table2, info_tree, level)
+                diff = self._diff_leaf_by_row_hash(table1, table2, info_tree, level)
+                if diff is not None:
+                    return diff
 
             rows1, rows2 = self._threaded_call("get_values", [table1, table2])
             diff = self._compare_rows(table1, table2, rows1, rows2)
@@ -313,7 +315,8 @@ class HashDiffer(TableDiffer):
 
     def _diff_leaf_by_row_hash(self, table1: TableSegment, table2: TableSegment, info_tree: InfoTree, level: int):
         """Compare a small segment by the key, row hash and NULL mask of each row, then download
-        and compare only the rows that differ, by key.
+        and compare only the rows that differ, by key. None when fetching by key doesn't return
+        exactly the rows those keys have, and the caller downloads every row instead.
 
         The result is the same as comparing every row: a row whose hash and NULL mask match has
         the same normalized values, unless 48 bits of MD5 collide, or text with '|' in it moves
@@ -347,6 +350,19 @@ class HashDiffer(TableDiffer):
             fetched1, fetched2 = self._thread_map(lambda t: t.get_rows_by_keys(batch), [table1, table2])
             rows1 += fetched1
             rows2 += fetched2
+
+        # A key selects its row only if the normalized key, made back into a value, equals the stored
+        # one. Where it doesn't (a text UUID key in mixed case, or with spaces around it), the row
+        # would be missed without a word, so the segment is compared by downloading every row.
+        def key_counts(rows, key_indices) -> Counter:
+            return Counter(key for key in (tuple(row[i] for i in key_indices) for row in rows) if key in suspects)
+
+        hash_keys = range(key_size)
+        for hashes, rows, table in ((hashes1, rows1, table1), (hashes2, rows2, table2)):
+            row_keys = [table.relevant_columns.index(c) for c in table.key_columns]
+            if key_counts(hashes, hash_keys) != Counter(tuple(row[i] for i in row_keys) for row in rows):
+                logger.info(". " * level + "Fetching rows by key missed some, so the segment downloads every row.")
+                return None
         diff = self._compare_rows(table1, table2, rows1, rows2)
 
         info_tree.info.set_diff(diff)

@@ -978,6 +978,29 @@ class TestLeafRowHash(DiffTestCase):
         self.assertEqual([("-", ("2", "b", "x")), ("-", ("2", "b", "x")), ("+", ("2", "b", "x"))], diff)
 
 
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashTextUUIDKey(DiffTestCase):
+    """A text UUID key in mixed case can't be fetched by key, because the key's literal is in one
+    case. The segment must then download every row, not lose the rows it missed."""
+
+    src_schema = {"id": str, "v": int}
+    dst_schema = {"id": str, "v": int}
+
+    def test_mixed_case_keys_are_all_reported(self):
+        ids = [str(uuid.UUID(int=i * 7919 + 12345)) for i in range(30)]
+        ids = [u.upper() if i % 2 else u for i, u in enumerate(ids)]
+        rows1 = [(u, i) for i, u in enumerate(ids)]
+        rows2 = [(u, i + 1000 if i in (3, 4) else i) for i, u in enumerate(ids)]
+        self.connection.query([self.src_table.insert_rows(rows1), self.dst_table.insert_rows(rows2), commit])
+        segments = [
+            table_segment(self.connection, path, "id", extra_columns=("v",), case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+        diff = list(HashDiffer(bisection_factor=2, bisection_threshold=100).diff_tables(*segments))
+        expected = [("-", (ids[i], str(i))) for i in (3, 4)] + [("+", (ids[i], str(i + 1000))) for i in (3, 4)]
+        self.assertEqual(sorted(expected), sorted(diff))
+
+
 class TestLeafRowHashJSON(DiffTestCase):
     db_cls = db.PostgreSQL
 
