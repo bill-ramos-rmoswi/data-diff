@@ -8,7 +8,12 @@ PERF_ALGORITHM=rowhash times the algorithm that reads each table once, instead o
 
 Each pair runs three scenarios, which change the target table and then restore it: identical
 tables, updated rows, and deleted rows. A run fails if data-diff doesn't report exactly the rows
-that were changed. Results go to benchmark_<revision>.jsonl, which dev/graph.py can chart.
+that were changed. Results go to benchmark_<revision>.jsonl, which dev/graph.py can chart, or to
+PERF_RESULTS_FILE.
+
+Before each scenario it prints a timestamped "[i/N] start" line, and appends it to
+PERF_PROGRESS_FILE too when that's set, so dev/status.sh can show how far a long run is. Each
+result records the rig that dev/bench/rig.py check last saw (.runs/rig.json, or PERF_RIG_FILE).
 """
 import json
 import os
@@ -45,6 +50,41 @@ if os.environ.get("PERF_PAIRS"):
 ALGORITHM = os.environ.get("PERF_ALGORITHM", "hashdiff")
 # Describes the ASE server for the results, such as "2g image defaults"
 SYBASE_CONFIG = os.environ.get("SYBASE_CONFIG", "")
+PROGRESS_FILE = os.environ.get("PERF_PROGRESS_FILE")
+RESULTS_FILE = os.environ.get("PERF_RESULTS_FILE")
+RIG_FILE = os.environ.get("PERF_RIG_FILE", os.path.join(os.path.dirname(__file__), "..", "..", ".runs", "rig.json"))
+
+
+def rig_fingerprint() -> dict:
+    """The settings dev/bench/rig.py check last read, so results from different rigs aren't mixed."""
+    try:
+        with open(RIG_FILE, encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return {"profile": "unknown: run dev/bench/rig.py check"}
+
+
+class Progress:
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self.started = time.monotonic()
+
+    def start(self, what: str):
+        self.done += 1
+        elapsed = time.monotonic() - self.started
+        eta = ""
+        if self.done > 1:
+            remaining = elapsed / (self.done - 1) * (self.total - self.done + 1)
+            eta = f", about {remaining / 60:.0f} min left"
+        line = f"{datetime.now():%H:%M:%S} [{self.done}/{self.total}] start {what} ({elapsed / 60:.1f} min in{eta})"
+        print(line, flush=True)
+        if PROGRESS_FILE:
+            with open(PROGRESS_FILE, "a", encoding="utf-8") as file:
+                file.write(line + "\n")
+
+
+PROGRESS = Progress(0)
 
 # One date, for a fifth of the products, in every ScaleKey. Spreads about 0.016% of rows across the table.
 PRODUCT_KEYS = ", ".join(str(key) for key in range(5, 610, 5))
@@ -132,12 +172,17 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
             "changed_rows": len(keys) if scenario != "identical" else 0,
             "threads": THREADS,
             "algorithm": ALGORITHM,
+            "rig": RIG,
         }
         if "Sybase" in (source, target):
             result["sybase_config"] = SYBASE_CONFIG
-        with open(f"benchmark_{revision}.jsonl", "a", encoding="utf-8") as file:
+        with open(RESULTS_FILE or f"benchmark_{revision}.jsonl", "a", encoding="utf-8") as file:
             file.write(json.dumps(result) + "\n")
 
+    def step(scenario: str):
+        PROGRESS.start(f"{source} -> {target} {table} {scenario}")
+
+    step("identical")
     diff, duration = run_diff(source, target, table)
     check("identical", diff, set(), set())
     record("identical", duration, len(diff))
@@ -148,6 +193,7 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
     )
     conn.query(commit)
     try:
+        step("updated")
         diff, duration = run_diff(source, target, table)
         check("updated", diff, keys, {"-", "+"})
         record("updated", duration, len(diff))
@@ -162,6 +208,7 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
     conn.query(f"DELETE FROM {changed_rows(conn, table_sql)}", None)
     conn.query(commit)
     try:
+        step("deleted")
         diff, duration = run_diff(source, target, table)
         check("deleted", diff, keys, {"-"})
         record("deleted", duration, len(diff))
@@ -171,9 +218,15 @@ def run_pair(source: str, target: str, table: str, row_count: int, revision: str
     conn.close()
 
 
+RIG = None
+
+
 def main():
+    global RIG
     revision = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
     tables = sys.argv[1:] or ["fact_2x"]
+    RIG = rig_fingerprint()
+    PROGRESS.total = len(tables) * len(PAIRS) * 3
     for table in tables:
         conn = connect(URIS["PostgreSQL"], shared=False)
         row_count = conn.query(f"SELECT count(*) FROM {table}", int)

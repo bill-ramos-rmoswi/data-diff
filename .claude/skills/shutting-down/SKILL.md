@@ -42,9 +42,9 @@ Report open PRs with failing or running checks, and any workflow run in progress
 
 ## 4. This session
 
-- Background tasks you started (test runs, watches, `run_perf.py`): list any still running, and ask whether to stop them or let them finish.
+- Background tasks you started (test runs, watches, `run_perf.py`, `ab.py`): list any still running, and ask whether to stop them or let them finish. `bash dev/status.sh` also shows jobs that other sessions started, and orchestrated runs in `.runs/`.
 - Anything learned this session that isn't in the repo or CLAUDE.md and would be needed next time: offer to save it as a memory. Don't save what git history already records.
-- Write the handoff as a project memory named `handoff`, replacing the previous one. Its body has what was done, what's in progress (branch, PR, background jobs), the next step as a prompt the user can paste (for example `/perf ...` or the next phase of a one-shot prompt), and the model that step needs. `/hello` reads it, so the next session doesn't start from pasted output. Do this without asking, because it changes nothing in the repo.
+- Write the handoff as a project memory named `handoff-<topic>`, for example `handoff-tuning-run`, replacing only an earlier one on the same topic. For an orchestrated run, the topic is the run id. A single `handoff` was overwritten on 11 November by a session running in parallel, and the resumed session read the wrong next step. Delete handoffs whose work is finished. Its body has what was done, what's in progress (branch, PR, background jobs), the next step as a prompt the user can paste (for example `/perf ...` or the next phase of a one-shot prompt), and the model that step needs. `/hello` reads it, so the next session doesn't start from pasted output. Do this without asking, because it changes nothing in the repo.
 - Finish with a handoff of at most five lines: what was done, what's in progress, and the next step. The session is saved in WSL at `~/.claude-devcontainer` (or `~/.claude` in WSL), so `claude --continue` reopens it.
 
 ## 5. Databases
