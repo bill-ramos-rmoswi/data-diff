@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 import uuid
 import unittest
+import unittest.mock
 
 import attrs
 
@@ -970,6 +971,21 @@ class TestLeafRowHash(DiffTestCase):
         self.assertEqual(sorted(expected), sorted(diff))
         # The changed rows, and the rows only one side has, which are in different segments
         self.assertEqual(len(changed) + 2, stats["rows_fetched_by_key"])
+
+    def test_segment_where_most_rows_differ_downloads_every_row(self):
+        # More suspects than one query fetches, and more than half the rows
+        patch = unittest.mock.patch("data_diff.hashdiff_tables.LEAF_KEY_BATCH", 5)
+        patch.start()
+        self.addCleanup(patch.stop)
+        rows1 = [(i, f"v{i}", "same") for i in range(1, 21)]
+        rows2 = [(i, f"v{i}" if i % 4 == 0 else "changed", "same") for i in range(1, 21)]
+        diff, stats = self.diff(rows1, rows2)
+        changed = [i for i in range(1, 21) if i % 4]
+        expected = [("-", (str(i), f"v{i}", "same")) for i in changed] + [
+            ("+", (str(i), "changed", "same")) for i in changed
+        ]
+        self.assertEqual(sorted(expected), sorted(diff))
+        self.assertEqual(0, stats.get("rows_fetched_by_key", 0))
 
     def test_duplicate_keys_are_reported(self):
         rows1 = [(1, "a", "x"), (2, "b", "x"), (2, "b", "x")]

@@ -31,6 +31,9 @@ DEFAULT_BISECTION_THRESHOLD = 1024 * 16
 DEFAULT_BISECTION_FACTOR = 32
 # Keys per query when a small segment downloads the rows whose hashes differ
 LEAF_KEY_BATCH = 500
+# Past this share of a segment's rows differing, fetching them by key costs more than downloading every
+# row: on a 15,000-row segment where every row differed, 2 to 4 times as much on PostgreSQL and Db2
+LEAF_MAX_SUSPECT_SHARE = 0.5
 
 logger = logging.getLogger("hashdiff_tables")
 
@@ -342,6 +345,10 @@ class HashDiffer(TableDiffer):
         suspects.update(key for key, value in by_key1.items() if by_key2.get(key) != value)
         suspects.update(key for key in by_key2 if key not in by_key1)
         del by_key1, by_key2
+        # A segment with few suspects fetches them in one query either way
+        if len(suspects) > max(LEAF_KEY_BATCH, LEAF_MAX_SUSPECT_SHARE * max(len(hashes1), len(hashes2))):
+            logger.info(". " * level + f"{len(suspects)} row hashes differ, so the segment downloads every row.")
+            return None
 
         rows1, rows2 = [], []
         keys = sorted(suspects)
