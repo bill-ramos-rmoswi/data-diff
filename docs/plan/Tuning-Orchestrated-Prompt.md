@@ -14,7 +14,7 @@ Before you start:
    docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d --wait postgres mysql mssql db2
    docker compose -f docker-compose.yml -f docker-compose.bench.yml --profile ase up -d --wait ase
    ```
-2. In the devcontainer, apply the rig settings, and run any restart it prints in WSL: `poetry run python dev/bench/rig.py apply`.
+2. In the devcontainer, apply the rig settings, and run the Db2 restart it prints in WSL: `poetry run python dev/bench/rig.py apply`.
 3. Fill in MY ANSWERS below.
 4. Start a session on Sonnet, and run `/orchestrate docs/plan/Tuning-Orchestrated-Prompt.md`.
 5. To watch it, run `bash dev/status.sh` in any terminal, or `/status`.

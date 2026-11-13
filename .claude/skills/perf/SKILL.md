@@ -32,7 +32,7 @@ Numbers are comparable only on the matched rig: `docker-compose.bench.yml`, 4 vC
 poetry run python dev/bench/rig.py check           # about 10 s. Must end with "Rig: bench"
 ```
 
-If it doesn't, give the user the WSL commands from the top of `docker-compose.bench.yml`, then run `rig.py apply`, which may print a restart for Db2 or ASE. To measure the noise, run `rig.py check --noise 5`.
+If it doesn't, give the user the WSL commands from the top of `docker-compose.bench.yml`, then run `rig.py apply`, which prints a Db2 restart to run in WSL. To measure the noise, run `rig.py check --noise 5`.
 
 ## 4. Run in the background
 
