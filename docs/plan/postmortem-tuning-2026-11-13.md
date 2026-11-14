@@ -60,6 +60,12 @@ The run took 15 hours of wall time, from 01:41 to 16:55. Of that, 8 h 13 min was
    - The wheel was never installed before it was published.
    - There were no checksums, provenance or SBOM.
 
+   **The first smoke test of the published 0.15.0 wheel failed twice**, in a clean venv:
+   - `python -m data_diff` didn't start. pip resolved pydantic 2.14, and the dbt and Datafold modules use the pydantic 1 API. `poetry.lock` pins 1.10.12, so no test or dev session could see this.
+   - `--bisection-factor` and `--bisection-threshold` crashed hashdiff, because the CLI passed them as text. This came from upstream.
+
+   The Python API, which is this fork's use case, worked. Both are fixed in `chore/postmortem-tuning`.
+
 ## What changes
 
 | Problem | Change |
