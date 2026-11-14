@@ -37,6 +37,18 @@ class RowHash(ExprNode):
 
 
 @attrs.define(frozen=True)
+class LengthPrefixed(ExprNode):
+    """The value's length in UTF-8 bytes, ``:``, and the value, or NULL. Leaf row hashes use it, so
+    that ``|`` in text can't move between columns."""
+
+    expr: ExprNode
+
+    @property
+    def type(self) -> Optional[type]:
+        return str
+
+
+@attrs.define(frozen=True)
 class DigestNeedsClient(ExprNode):
     """1 for a row with a large value that the database can't hash, which the client must fetch."""
 

@@ -17,7 +17,7 @@ You need Python 3.9 or later, and:
 - On Linux, glibc 2.34 or later for the Db2 driver.
 
 ```shell
-pip install "data-diff[db2,mssql,postgresql,sybase] @ https://github.com/bill-ramos-rmoswi/data-diff/releases/download/v0.15.0/data_diff-0.15.0-py3-none-any.whl"
+pip install "data-diff[db2,mssql,postgresql,sybase] @ https://github.com/bill-ramos-rmoswi/data-diff/releases/download/v0.16.0/data_diff-0.16.0-py3-none-any.whl"
 ```
 
 What changed in each version, with upgrade notes, is in [CHANGELOG.md](CHANGELOG.md).
@@ -194,19 +194,19 @@ These timings simulate comparing an on-premises database with Aurora PostgreSQL,
 - `fact_2x` and `fact_13x` are `FactProductInventory` from Microsoft's AdventureWorksDW2022, enlarged by `dev/perf/seed.py`: 1.55M and 10.09M rows, a three-column integer key and five compared columns.
 - `oltp_order_line` is 2M rows of about 330 bytes of text, with a two-column integer key and 14 columns, 4 of them with NULLs. `dev/perf/seed_oltp.py` creates it.
 
-Times are in seconds, for a whole `diff_tables()` call with 4 threads per database, as before / after the performance changes on this branch. "Before" is master (`7f4ad77`). "After" is `9b87b1f` for the two fact tables and `4286f27` (the branch head) for `oltp_order_line`. Three review fixes separate them, and they only change leaves where most rows differ or a key can't be fetched. Each figure is the median of alternating runs from `dev/perf/ab.py`: 5 for the fact tables and 3 for `oltp_order_line`.
+Times are in seconds, for a whole `diff_tables()` call with 4 threads per database, as before / after the performance changes since 0.14.0. "Before" is `7f4ad77` (v0.14.0) and "after" is `c1724ba`. Each figure is the median of 5 alternating runs from `dev/perf/ab.py`.
 
 | Source → PostgreSQL | `fact_2x`: identical / updated / deleted | `fact_13x`: identical / updated / deleted | `oltp_order_line`: identical / updated / deleted |
 | --- | --- | --- | --- |
-| SAP ASE 16.1 | 3.2 / 6.6 / 6.7 → 1.1 / 3.9 / 4.0 | 20.6 / 44.7 / 45.1 → 7.2 / 30.8 / 31.1 | 21.4 / 40.2 / 40.6 → 5.8 / 17.0 / 17.3 |
-| Db2 12.1 | 1.6 / 7.2 / 6.8 → 0.9 (noise) / 3.1 / 3.0 | 12.9 / 44.6 / 45.3 → 8.2 / 21.4 / 21.7 | 2.8 / 18.0 / 17.9 → 1.6 / 4.7 / 4.9 |
-| SQL Server 2025 | 20.1 / 28.6 / 29.0 → 6.3 / 7.2 / 7.1 | 28.8 / 72.7 / 73.2 → 16.9 / 35.0 / 36.0 | 35.2 / 91.5 / 91.6 → 20.9 / 33.3 / 31.9 |
+| SAP ASE 16.1 | 3.1 / 6.6 / 6.7 → 1.1 / 3.9 / 4.0 | 20.1 / 44.6 / 44.7 → 7.4 / 30.5 / 31.1 | 21.5 / 41.2 / 41.3 → 6.2 / 17.4 / 17.7 |
+| Db2 12.1 | 1.6 / 7.1 / 6.7 → 0.9 (noise) / 3.1 / 3.1 | 12.9 / 44.8 / 45.2 → 8.2 / 22.3 / 22.5 | 2.9 / 18.4 / 18.1 → 1.5 / 5.0 / 5.2 |
+| SQL Server 2025 | 20.1 / 28.4 / 28.8 → 6.2 / 8.3 / 8.3 | 28.8 / 73.2 / 73.4 → 17.1 / 35.1 / 35.8 | 35.3 / 91.9 / 92.1 → 20.2 / 30.6 / 30.4 |
 
 - **identical**: the tables match.
 - **updated**: `UnitCost` changed on about 0.016% of the PostgreSQL rows in the fact tables (242 in `fact_2x`, 1,573 in `fact_13x`), spread across the table. In `oltp_order_line`, `Quantity` changed on 166 rows.
 - **deleted**: the same rows deleted from PostgreSQL.
 
-Every run reported exactly the rows that were changed. The run-to-run noise that `ab.py` measured has a median of 5% on the fact tables and 9% on `oltp_order_line`, and the changes it counts are beyond twice each row's own noise. Db2 `fact_2x` identical (1.6 to 0.9 seconds) had 51% noise, so it isn't a result. Db2 `oltp_order_line` identical had 14%. The gains range from 31% (ASE, `fact_13x`, updated) to 76% (SQL Server, `fact_2x`, deleted). A check with the same revision on both sides (5 runs) showed no change on any row, with a median noise of 5%.
+The run-to-run noise that `ab.py` measured has a median of 6%, and a change counts only beyond twice its own row's noise. Db2 `fact_2x` identical (1.6 to 0.9 seconds) had 27% noise, so it isn't a result. The other 26 rows are faster, by 30.5% (ASE, `fact_13x`, deleted) to 72.8% (Db2, `oltp_order_line`, updated). The SQL Server `fact_2x` rows and `oltp_order_line` deleted had 18-22% noise, so their figures are less exact.
 
 The rig is the matched one (`docker-compose.bench.yml` and `dev/bench/rig.py apply`): every database has 4 pinned vCPUs and 4 GB, on one workstation (Core Ultra 7 255H, 16 cores, 24 GB). `N_THREADS=4`, and the Python API now derives its thread pool from that. Db2 Community Edition is limited to 4 cores, and the ASE trial runs in a container. These numbers compare sources with each other, rather than predict production times: a real run also depends on the network between the host running data-diff and each database, and on Aurora's instance size. The earlier table, measured on the everyday stack before the rig existed, differed by about 20% from one run to the next, and its SQL Server numbers included CPU thrash.
 

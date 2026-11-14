@@ -1051,3 +1051,296 @@ class TestLeafRowHashJSON(DiffTestCase):
         self.assertEqual([], list(differ.diff_tables(*segments)))
         # The row hashes differ, so the row is fetched, and diff_sets() finds the JSON equal
         self.assertEqual(1, differ.stats["rows_fetched_by_key"])
+
+
+def capture_sql(connection) -> tuple:
+    """A patch that records each SQL statement the connection's class runs, and the list it fills."""
+    statements = []
+    cls = type(connection)
+    original = cls._query
+
+    def spy(self, sql_code):
+        if isinstance(sql_code, str):
+            statements.append(sql_code)
+        return original(self, sql_code)
+
+    return unittest.mock.patch.object(cls, "_query", spy), statements
+
+
+class LeafSeparatorCase(DiffTestCase):
+    """A leaf hashes each column that can hold '|' with its length in bytes in front, so that '|' that
+    moves between neighboring columns ('a|b','c' against 'a','b|c') changes the row hash. The
+    threshold is above the table size, so the root segment is the leaf."""
+
+    key = ("id",)
+    columns = ("c1", "c2", "c3")
+    threshold = 4000
+
+    # NULL, the text '<null>', the empty string, trailing spaces, separators and text outside ASCII
+    TEXTS = ["a|b", "|", "||", "", "a  ", "é", "漢", "😀", "<null>", None]
+
+    def segments(self):
+        return [
+            table_segment(self.connection, path, self.key, extra_columns=self.columns, case_sensitive=False)
+            for path in (self.table_src_path, self.table_dst_path)
+        ]
+
+    def insert(self, rows1, rows2):
+        self.connection.query([self.src_table.insert_rows(rows1), self.dst_table.insert_rows(rows2), commit])
+
+    def diff(self, rows1=None, rows2=None):
+        if rows1 is not None:
+            self.insert(rows1, rows2)
+        differ = HashDiffer(bisection_factor=2, bisection_threshold=self.threshold)
+        diff = sorted(differ.diff_tables(*self.segments()))
+        return diff, differ.stats
+
+    def expected(self, rows1, rows2, keys) -> list:
+        def as_text(row):
+            return tuple(None if v is None else str(v) for v in row)
+
+        key_size = len(self.key)
+        diff = [("-", as_text(row)) for row in rows1 if tuple(row[:key_size]) in keys]
+        diff += [("+", as_text(row)) for row in rows2 if tuple(row[:key_size]) in keys]
+        return sorted(diff)
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashSeparator(LeafSeparatorCase):
+    src_schema = {"id": int, "c1": str, "c2": str, "c3": str}
+    dst_schema = {"id": int, "c1": str, "c2": str, "c3": str}
+
+    def text_rows(self, n=30):
+        t = self.TEXTS
+        return [(i, t[i % 10], t[(i + 3) % 10], t[(i * 7) % 10]) for i in range(1, n + 1)]
+
+    def plain_rows(self, n):
+        return [(i, f"v{i}", "w", "x") for i in range(1, n + 1)]
+
+    @staticmethod
+    def swap(rows, changes: dict) -> list:
+        return [(row[0], *changes[row[0]]) if row[0] in changes else row for row in rows]
+
+    def test_equal_text_with_separators_fetches_nothing(self):
+        rows = self.text_rows()
+        diff, stats = self.diff(rows, rows)
+        self.assertEqual([], diff)
+        self.assertEqual(30, stats["rows_downloaded"])
+        self.assertEqual(0, stats["rows_fetched_by_key"])
+
+    def test_text_with_separators_that_differs_is_reported(self):
+        rows1 = self.text_rows()
+        rows2 = self.swap(rows1, {7: ("a|b", "", "😀 "), 12: ("|", "||", None)})
+        diff, stats = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(7,), (12,)}), diff)
+        self.assertEqual(2, stats["rows_fetched_by_key"])
+
+    def test_prefixed_hash_is_the_python_reference(self):
+        # The same reference on both databases is what lets a Db2 leaf agree with a PostgreSQL one
+        rows = self.text_rows()
+        self.insert(rows, rows)
+        segment = self.segments()[0].with_schema()
+        hashes = segment.get_key_hashes(null_mask=True, length_columns=self.columns)
+
+        def prefixed(value):
+            return "<null>" if value is None else f"{len(value.encode('utf-8'))}:{value}"
+
+        expected = {
+            str(row[0]): str_to_checksum("|".join([str(row[0])] + [prefixed(v) for v in row[1:]])) for row in rows
+        }
+        self.assertEqual(expected, {key: row_hash for key, row_hash, *_ in hashes})
+
+    def test_separator_moving_between_columns_is_reported(self):
+        rows1 = self.swap(self.plain_rows(2000), {500: ("a|b", "c", "x")})
+        rows2 = self.swap(rows1, {500: ("a", "b|c", "x")})
+        diff, stats = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(500,)}), diff)
+        self.assertEqual(1, stats["rows_fetched_by_key"])
+
+    def test_other_moved_separators_are_reported(self):
+        pairs = {
+            100: (("|", "", "x"), ("", "|", "x")),
+            900: (("x|", "|y", "x"), ("x", "||y", "x")),
+            1500: (("a|b", "c", "x"), ("a", "b|c", "x")),
+            1700: (("v", "p|", "q"), ("v", "p", "|q")),
+        }
+        rows1 = self.swap(self.plain_rows(2000), {k: a for k, (a, _) in pairs.items()})
+        rows2 = self.swap(rows1, {k: b for k, (_, b) in pairs.items()})
+        diff, stats = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(k,) for k in pairs}), diff)
+        self.assertEqual(4, stats["rows_fetched_by_key"])
+
+    def test_most_rows_with_moved_separators_download_every_row(self):
+        # More suspects than one query fetches, and more than half the rows
+        patch = unittest.mock.patch("data_diff.hashdiff_tables.LEAF_KEY_BATCH", 5)
+        patch.start()
+        self.addCleanup(patch.stop)
+        rows1 = [(i, f"a|{i}", "b", "c") for i in range(1, 21)]
+        rows2 = [(i, "a", f"{i}|b", "c") if i <= 15 else rows1[i - 1] for i in range(1, 21)]
+        diff, stats = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(i,) for i in range(1, 16)}), diff)
+        self.assertEqual(0, stats.get("rows_fetched_by_key", 0))
+
+    def test_every_row_with_a_moved_separator(self):
+        rows1 = [(i, f"a|{i}", "b", "c") for i in range(1, 21)]
+        rows2 = [(i, "a", f"{i}|b", "c") for i in range(1, 21)]
+        diff, _ = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(i,) for i in range(1, 21)}), diff)
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashSeparatorCompositeKey(LeafSeparatorCase):
+    src_schema = {"order_id": int, "line_number": int, "c1": str, "c2": str}
+    dst_schema = {"order_id": int, "line_number": int, "c1": str, "c2": str}
+    key = ("order_id", "line_number")
+    columns = ("c1", "c2")
+
+    def test_composite_key_separator(self):
+        rows1 = [(o, n, f"o{o}|", f"|l{n}") for o in range(1, 51) for n in range(1, 5)]
+        changes = {(17, 3): ("o17||", "l3"), (33, 2): ("changed", "|l2")}
+        rows2 = [(o, n, *changes[(o, n)]) if (o, n) in changes else (o, n, a, b) for o, n, a, b in rows1]
+        diff, stats = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, set(changes)), diff)
+        self.assertEqual(2, stats["rows_fetched_by_key"])
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashSeparatorNulls(LeafSeparatorCase):
+    src_schema = {"id": int, "c1": str, "c2": str, "c3": str, "c4": str, "c5": str, "c6": str}
+    dst_schema = {"id": int, "c1": str, "c2": str, "c3": str, "c4": str, "c5": str, "c6": str}
+    columns = ("c1", "c2", "c3", "c4", "c5", "c6")
+
+    def test_nulls_and_separators(self):
+        values = [None, "<null>", "", "|", "<null>|", None]
+        rows1 = [(i, *(values[(i + j) % 6] for j in range(6))) for i in range(1, 41)]
+        rows1[19] = (20, "|", "", None, "<null>", None, "|")
+        rows2 = list(rows1)
+        rows2[19] = (20, "", "|", None, "<null>", None, "|")
+        diff, stats = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(20,)}), diff)
+        self.assertEqual(1, stats["rows_fetched_by_key"])
+
+
+@test_each_database_in_list({db.PostgreSQL})
+class TestLeafRowHashSeparatorNativeUUID(LeafSeparatorCase):
+    src_schema = {"id": "uuid", "c1": str, "c2": str}
+    dst_schema = {"id": "uuid", "c1": str, "c2": str}
+    columns = ("c1", "c2")
+
+    def test_native_uuid_key_separator(self):
+        # The key range is wide, so the root bisects. Rows 3 and 4 are in the same half, and the
+        # change in row 4 makes that half's checksum differ, which a moved '|' alone can't.
+        ids = [str(uuid.UUID(int=i * 7919 + 12345)) for i in range(30)]
+        rows1 = [(u, "a|b", "c") for u in ids]
+        rows2 = list(rows1)
+        rows2[3] = (ids[3], "a", "b|c")
+        rows2[4] = (ids[4], "changed", "c")
+        diff, _ = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(ids[3],), (ids[4],)}), diff)
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashTextUUIDKeySeparator(LeafSeparatorCase):
+    """Text UUID keys that fetching by key can miss, with '|' moving between columns in that row."""
+
+    src_schema = {"id": str, "c1": str, "c2": str}
+    dst_schema = {"id": str, "c1": str, "c2": str}
+    columns = ("c1", "c2")
+    threshold = 100
+
+    def test_mixed_case_key_with_a_moved_separator_is_reported(self):
+        # Row 3's key is in uppercase, so fetching it by key misses it, and the segment downloads
+        # every row. Row 4, in lowercase and in the same half, is what makes the half differ.
+        ids = [str(uuid.UUID(int=i * 7919 + 12345)) for i in range(30)]
+        ids = [u.upper() if i % 2 else u for i, u in enumerate(ids)]
+        rows1 = [(u, "a|b", "c") for u in ids]
+        rows2 = list(rows1)
+        rows2[3] = (ids[3], "a", "b|c")
+        rows2[4] = (ids[4], "changed", "c")
+        diff, _ = self.diff(rows1, rows2)
+        self.assertEqual(self.expected(rows1, rows2, {(ids[3],), (ids[4],)}), diff)
+
+    def test_moved_separator_at_a_key_that_isnt_a_uuid_is_reported(self):
+        # The sampled rows (the first 64) are UUIDs, so the key is a UUID type, and the last key
+        # can't be made into one. Row 45 sorts next to it, and its change makes the segment differ.
+        ids = [str(uuid.UUID(int=(i << 121) + i)) for i in range(1, 100)] + ["5zzz-not-a-uuid"]
+        rows1 = [(u, "a|b", "c") for u in ids]
+        rows2 = list(rows1)
+        rows2[44] = (ids[44], "changed", "c")
+        rows2[-1] = (ids[-1], "a", "b|c")
+        for t, rows in ((self.src_table, rows1), (self.dst_table, rows2)):
+            for row in rows:  # one at a time, so the sample is the first rows inserted
+                self.connection.query(t.insert_row(*row))
+        self.connection.query(commit)
+        diff, _ = self.diff()
+        self.assertEqual(self.expected(rows1, rows2, {(ids[44],), (ids[-1],)}), diff)
+
+
+@test_each_database_in_list({db.PostgreSQL, db.Db2})
+class TestLeafRowHashSeparatorNumericOnly(LeafSeparatorCase):
+    """Columns that can't hold '|' keep the leaf SQL as it was."""
+
+    src_schema = {"id": int, "d": "DECIMAL(10, 2)", "dt": "DATE", "ts": "TIMESTAMP", "b": "BOOLEAN"}
+    dst_schema = {"id": int, "d": "DECIMAL(10, 2)", "dt": "DATE", "ts": "TIMESTAMP", "b": "BOOLEAN"}
+    columns = ("d", "dt", "ts", "b")
+
+    def test_numeric_only_leaf_sql_is_unchanged(self):
+        for name, changed in ((self.table_src_name, "1.25"), (self.table_dst_name, "1.26")):
+            q = self.connection.dialect.quote
+            for i in range(1, 11):
+                d = changed if i == 5 else f"{i}.5"
+                self.connection.query(
+                    f"INSERT INTO {q(name)} VALUES ({i}, {d}, '2026-01-0{i % 9 + 1}', "
+                    f"'2026-01-02 03:04:0{i % 10}', {'TRUE' if i % 2 else 'FALSE'})",
+                    None,
+                )
+        self.connection.query(commit)
+
+        calls = []
+        get_key_hashes = TableSegment.get_key_hashes
+
+        def spy(segment, *args, **kwargs):
+            calls.append((segment, kwargs))
+            return get_key_hashes(segment, *args, **kwargs)
+
+        patch_sql, statements = capture_sql(self.connection)
+        with unittest.mock.patch.object(TableSegment, "get_key_hashes", spy), patch_sql:
+            diff, stats = self.diff()
+        self.assertEqual({("-", "5"), ("+", "5")}, {(sign, row[0]) for sign, row in diff})
+        self.assertEqual(1, stats["rows_fetched_by_key"])
+        self.assertEqual(2, len(calls))
+        self.assertFalse([s for s in statements if "octet_length" in s.lower()])
+
+        for segment, kwargs in calls:
+            sqls = []
+            for options in (kwargs, {"null_mask": True}):
+                patch_sql, statements = capture_sql(self.connection)
+                with patch_sql:
+                    get_key_hashes(segment, **options)
+                sqls.append(statements)
+            self.assertEqual(sqls[0], sqls[1])
+
+
+@test_each_database_in_list({db.Db2})
+class TestLeafRowHashDb2Limit(LeafSeparatorCase):
+    """Db2 fails a concatenation over 32,672 bytes (SQL0137N), so a row that fits only without the
+    lengths makes the segment download every row."""
+
+    src_schema = {"id": int, "c1": "VARCHAR(32000)", "c2": "VARCHAR(700)"}
+    dst_schema = {"id": int, "c1": "VARCHAR(32000)", "c2": "VARCHAR(700)"}
+    columns = ("c1", "c2")
+
+    def test_hash_input_near_db2_limit_downloads_every_row(self):
+        # Row 1 hashes 1 + 1 + 32,000 + 1 + 660 = 32,663 bytes, and 32,673 with '32000:' and '660:'
+        q = self.connection.dialect.quote
+        for name, changed in ((self.table_src_name, "y"), (self.table_dst_name, "z")):
+            self.connection.query(
+                f"INSERT INTO {q(name)} VALUES (1, REPEAT('a', 32000), REPEAT('b', 660)), (2, 'x', '{changed}')",
+                None,
+            )
+        self.connection.query(commit)
+        with self.assertLogs("hashdiff_tables", "INFO") as logs:
+            diff, stats = self.diff()
+        self.assertEqual([("+", ("2", "x", "z")), ("-", ("2", "x", "y"))], diff)
+        self.assertEqual(0, stats.get("rows_fetched_by_key", 0))
+        self.assertTrue([line for line in logs.output if "32,672" in line], logs.output)

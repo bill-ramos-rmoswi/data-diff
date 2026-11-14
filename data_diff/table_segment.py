@@ -1,5 +1,5 @@
 import time
-from typing import Container, Dict, List, Optional, Sequence, Tuple
+from typing import Collection, Container, Dict, List, Optional, Sequence, Tuple
 import logging
 from itertools import product
 
@@ -17,6 +17,7 @@ from data_diff.queries.ast_classes import BinBoolOp, BinOp, In, Select
 from data_diff.queries.extras import (
     ApplyFuncAndNormalizeAsString,
     DigestNeedsClient,
+    LengthPrefixed,
     NormalizeAsString,
     RawForClient,
     RowHash,
@@ -201,7 +202,7 @@ class TableSegment:
         select = self.make_select().select(*fetched_cols)
         return self.database.query(select, List[Tuple])
 
-    def get_key_hashes(self, null_mask: bool = False) -> list:
+    def get_key_hashes(self, null_mask: bool = False, length_columns: Collection[str] = ()) -> list:
         """Download the key and a hash of each row of the segment, in one pass.
 
         Each row is ``(*key, hash, needs_client)``. ``needs_client`` is 1 when the row has a large
@@ -210,8 +211,21 @@ class TableSegment:
         With ``null_mask``, each row ends with integers whose bits say which of the checked columns
         that aren't keys are NULL, 62 columns to an integer. The hash can't tell NULL from the
         text ``<null>``, and these can.
+
+        The checked columns in ``length_columns`` that aren't keys are hashed with their length in
+        bytes in front (``LengthPrefixed``), so that text with ``|`` can't move between neighboring
+        columns and keep the hash. Only dialects that render ``LengthPrefixed`` take them. Without
+        them, the hash is the one ``count_and_checksum`` sums.
         """
         checked_columns = [c for c in self.relevant_columns if c not in self.ignored_columns]
+        hashed = [
+            (
+                LengthPrefixed(NormalizeAsString(this[c]))
+                if c in length_columns and c not in self.key_columns
+                else NormalizeAsString(this[c])
+            )
+            for c in checked_columns
+        ]
         masks = []
         if null_mask:
             columns = [c for c in checked_columns if c not in self.key_columns]
@@ -220,7 +234,7 @@ class TableSegment:
                 masks.append(BinOp("+", [if_(this[c] == None, 1 << i, 0) for i, c in enumerate(chunk)]))  # noqa: E711
         select = self.make_select().select(
             *(NormalizeAsString(this[c]) for c in self.key_columns),
-            RowHash([NormalizeAsString(this[c]) for c in checked_columns]),
+            RowHash(hashed),
             DigestNeedsClient([this[c] for c in checked_columns]),
             *masks,
         )

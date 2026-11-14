@@ -16,9 +16,11 @@ from data_diff.abcs.database_types import (
     PrecisionType,
     String_UUID,
     StringType,
+    TemporalType,
     Boolean,
     JSON,
 )
+from data_diff.databases.base import QueryError
 from data_diff.info_tree import InfoTree
 from data_diff.utils import safezip, diffs_are_equiv_jsons
 from data_diff.thread_utils import ThreadedYielder
@@ -36,6 +38,18 @@ LEAF_KEY_BATCH = 500
 LEAF_MAX_SUSPECT_SHARE = 0.5
 
 logger = logging.getLogger("hashdiff_tables")
+
+
+def _may_hold_separator(coltype) -> bool:
+    """Whether a column's normalized value can contain '|', which joins the values a row hash hashes.
+
+    Digests, numbers, dates, booleans and native UUIDs can't. Anything else can, including text types
+    refined from sampled rows (UUIDs and alphanumerics), because the rows outside the sample can hold anything.
+    """
+    if getattr(coltype, "digest", None) is not None:
+        return False
+    return not isinstance(coltype, (NumericType, TemporalType, Boolean, Native_UUID))
+
 
 # Just for local readability: TODO: later switch to real type declarations of these.
 _Op = Literal["+", "-"]
@@ -322,12 +336,35 @@ class HashDiffer(TableDiffer):
         exactly the rows those keys have, and the caller downloads every row instead.
 
         The result is the same as comparing every row: a row whose hash and NULL mask match has
-        the same normalized values, unless 48 bits of MD5 collide, or text with '|' in it moves
-        between neighboring columns ('a|b', 'c' against 'a', 'b|c'). Checksums take both risks.
+        the same normalized values, unless 48 bits of MD5 collide, which checksums risk too.
+        Each column that may hold '|' is hashed with its length in bytes in front, on both sides
+        if either side's type may hold it, so that text with '|' can't move between neighboring
+        columns ('a|b', 'c' against 'a', 'b|c') and keep the hash, as it does in a checksum.
         Rows that differ only in a way diff_sets() forgives, such as JSON spacing, are fetched and
         then not reported.
         """
-        hashes1, hashes2 = self._thread_map(lambda t: t.get_key_hashes(null_mask=True), [table1, table2])
+        length_columns1, length_columns2 = [], []
+        for c1, c2 in safezip(table1.relevant_columns, table2.relevant_columns):
+            if c1 in table1.key_columns or c2 in table2.key_columns:
+                continue
+            if _may_hold_separator(table1._schema[c1]) or _may_hold_separator(table2._schema[c2]):
+                length_columns1.append(c1)
+                length_columns2.append(c2)
+
+        try:
+            hashes1, hashes2 = self._thread_map(
+                lambda args: args[0].get_key_hashes(null_mask=True, length_columns=args[1]),
+                [(table1, length_columns1), (table2, length_columns2)],
+            )
+        except QueryError as e:
+            # The lengths make the hash input longer than the plain one a checksum hashes
+            if "SQL0137N" not in str(e):
+                raise
+            logger.info(
+                ". " * level + "A row's hash input with lengths is over Db2's 32,672 bytes (SQL0137N), "
+                "so the segment downloads every row."
+            )
+            return None
         key_size = len(table1.key_columns)
         suspects = set()
 
