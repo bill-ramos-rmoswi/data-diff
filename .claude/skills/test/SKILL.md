@@ -16,6 +16,8 @@ Tests use `unittest`, not pytest. Full output can run to thousands of lines, so 
 | Digests, LOBs, `rowhash_tables.py` | `tests.test_rowhash` plus the `LargeValue` classes: `-k LargeValue` |
 | `queries/` | `tests.test_query tests.test_sql` |
 | hashdiff or joindiff | `tests.test_diff_tables tests.test_joindiff` |
+| Leaves, fetch by key, key ranges or the differ's thread pool | `tests.test_diff_tables tests.test_joindiff tests.test_api tests.test_sybase`, and check that the change has tests for the key shapes and densities in `/cross-db-design` |
+| `pyproject.toml`, packaging, `CHANGELOG.md` | `poetry build`, then `python3 dev/release/smoke_wheel.py dist/*.whl` and `python3 dev/release/notes.py` |
 | Before a commit or PR | everything: `poetry run unittest-parallel -j 8` |
 
 ## 2. Run it

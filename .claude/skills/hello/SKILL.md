@@ -47,7 +47,7 @@ git log --oneline HEAD..origin/master | head
 - If master has moved on and the current branch isn't master, say how many commits behind it is.
 - Open PRs and the latest CI runs: `gh pr list --repo bill-ramos-rmoswi/data-diff --author @me` and `gh run list --repo bill-ramos-rmoswi/data-diff --limit 5`. Report failed or running checks.
 - The `handoff-*` project memories written by `/shutting-down` (and an old `handoff`, if any): give each one's next step and the model it names. Also mention any other memories that describe work in progress.
-- Run `bash dev/status.sh`. Report orchestrated runs in `.runs/` that haven't finished, and jobs still running.
+- Run `bash dev/status.sh`. Report orchestrated runs in `.runs/` that haven't finished, and jobs still running. For a run that finished, check whether `docs/plan/` has a post-mortem that names it, and if it doesn't, suggest `/post-mortem <run-id>`.
 - If `.runs/rig.json` exists and doesn't say `"profile": "bench"`, note that the databases aren't on the matched benchmark rig. That only matters for benchmarks.
 
 ## 6. Report
