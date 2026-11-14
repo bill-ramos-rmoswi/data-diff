@@ -23,7 +23,8 @@ from data_diff.abcs.database_types import (
     Date,
     Time,
 )
-from data_diff.databases.base import BaseDialect, ThreadedDatabase, import_helper, ConnectError
+from data_diff.databases.base import BaseDialect, Compiler, ThreadedDatabase, import_helper, ConnectError
+from data_diff.queries.extras import LengthPrefixed
 from data_diff.utils import BINARY_DIGEST_CHUNK, DIGEST_HEXDIGITS, TEXT_DIGEST_CHUNK
 from data_diff.databases.base import (
     MD5_HEXDIGITS,
@@ -120,6 +121,11 @@ class PostgresqlDialect(BaseDialect):
 
     def md5_as_hex(self, s: str) -> str:
         return f"md5({s})"
+
+    def render_lengthprefixed(self, c: Compiler, elem: LengthPrefixed) -> str:
+        # octet_length doesn't scan the text, and agrees with Db2's OCTET_LENGTH in UTF-8
+        value = self.compile(c, elem.expr)
+        return f"(octet_length({value})::varchar || ':' || {value})"
 
     def normalize_timestamp(self, value: str, coltype: TemporalType) -> str:
         def _add_padding(coltype: TemporalType, timestamp6: str):

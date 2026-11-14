@@ -38,6 +38,7 @@ from data_diff.databases.base import (
     import_helper,
 )
 from data_diff.queries.ast_classes import CreateTable, TruncateTable
+from data_diff.queries.extras import LengthPrefixed
 from data_diff.utils import BINARY_DIGEST_CHUNK, TEXT_DIGEST_CHUNK
 
 
@@ -165,6 +166,12 @@ class Dialect(BaseDialect):
 
     def render_truncatetable(self, c: Compiler, elem: TruncateTable) -> str:
         return f"TRUNCATE TABLE {self.compile(c, elem.path)} IMMEDIATE"
+
+    def render_lengthprefixed(self, c: Compiler, elem: LengthPrefixed) -> str:
+        # The database is UTF-8 (code page 1208), so OCTET_LENGTH agrees with PostgreSQL's. A row whose
+        # hash input then exceeds 32,672 bytes fails with SQL0137N, and the leaf downloads its rows.
+        value = self.compile(c, elem.expr)
+        return f"(VARCHAR(OCTET_LENGTH({value})) || ':' || {value})"
 
     def normalize_timestamp(self, value: str, coltype: TemporalType) -> str:
         if isinstance(coltype, Date):
