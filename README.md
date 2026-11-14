@@ -20,6 +20,24 @@ You need Python 3.9 or later, and:
 pip install "data-diff[db2,mssql,postgresql,sybase] @ https://github.com/bill-ramos-rmoswi/data-diff/releases/download/v0.15.0/data_diff-0.15.0-py3-none-any.whl"
 ```
 
+What changed in each version, with upgrade notes, is in [CHANGELOG.md](CHANGELOG.md).
+
+### Verifying a release
+
+Each release after 0.15.0 also carries:
+
+- `SHA256SUMS`: checksums of its files
+- `sbom.spdx.json`: an SPDX SBOM of the wheel with every database extra
+- a signed build-provenance attestation
+
+Before every release, CI installs the wheel in a clean environment and runs a diff with it. To check a downloaded wheel:
+
+```shell
+gh release download v<version> --repo bill-ramos-rmoswi/data-diff -D data-diff-release
+cd data-diff-release && sha256sum -c SHA256SUMS
+gh attestation verify data_diff-<version>-py3-none-any.whl --repo bill-ramos-rmoswi/data-diff
+```
+
 ## Compare tables
 
 ```python
