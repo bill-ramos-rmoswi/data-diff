@@ -251,6 +251,48 @@ class TestPostgreSQLAgainstDb2(TypeTestCase):
         db2 = self.table(db.Db2, "CLOB(100K)", text)
         self.assert_both_directions((db.PostgreSQL, pg), (db.Db2, db2))
 
+    def text_table(self, db_cls, rows, name) -> str:
+        """Creates a table of (id, c1, c2, c3) text columns, and returns its name."""
+        conn = get_conn(db_cls)
+        q = conn.dialect.quote
+        table_name = f"{name}{self.suffix}"
+        columns = ", ".join(f"{q(c)} VARCHAR(20)" for c in ("c1", "c2", "c3"))
+        conn.query(f"CREATE TABLE {q(table_name)} ({q('id')} INT NOT NULL PRIMARY KEY, {columns})", None)
+        self.created.append((conn, q(table_name)))
+
+        def literal(v):
+            return "NULL" if v is None else str(v) if isinstance(v, int) else "'" + v.replace("'", "''") + "'"
+
+        values = ", ".join("(" + ", ".join(literal(v) for v in row) + ")" for row in rows)
+        conn.query(f"INSERT INTO {q(table_name)} VALUES {values}", None)
+        conn.query(commit)
+        return table_name
+
+    def test_leaf_text_with_separators(self):
+        # The root segment is the leaf. Every equal row must hash the same on both databases, or it
+        # would be fetched by key too, and only the moved '|' and the ordinary change are reported.
+        texts = ["a|b", "|", "||", "", "a  ", "é", "漢", "😀", "<null>", None]
+        rows = [(i, texts[i % 10], texts[(i + 3) % 10], texts[(i * 7) % 10]) for i in range(1, 31)]
+        pg = self.text_table(db.PostgreSQL, rows + [(31, "a|b", "c", "x"), (32, "v32", "w", "x")], "leaf_pg")
+        db2 = self.text_table(db.Db2, rows + [(31, "a", "b|c", "x"), (32, "changed", "w", "x")], "leaf_db2")
+        for a, b in (((db.PostgreSQL, pg), (db.Db2, db2)), ((db.Db2, db2), (db.PostgreSQL, pg))):
+            with self.subTest(f"{a[0].__name__} -> {b[0].__name__}"):
+                segments = [
+                    connect_to_table(CONN_STRINGS[cls], name, ("id",), extra_columns=("c1", "c2", "c3"), thread_count=2)
+                    for cls, name in (a, b)
+                ]
+                differ = HashDiffer(bisection_factor=2, bisection_threshold=4000)
+                try:
+                    diff = list(differ.diff_tables(*segments))
+                finally:
+                    for segment in segments:
+                        segment.database.close()
+                self.assertEqual(4, len(diff), diff)
+                self.assertEqual(
+                    {("-", "31"), ("+", "31"), ("-", "32"), ("+", "32")}, {(sign, row[0]) for sign, row in diff}
+                )
+                self.assertEqual(2, differ.stats["rows_fetched_by_key"])
+
 
 @requires(db.Db2)
 class TestDb2(TypeTestCase):

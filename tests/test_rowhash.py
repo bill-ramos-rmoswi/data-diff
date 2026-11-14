@@ -136,6 +136,35 @@ class TestRowHashDiffer(DiffTestCase):
         self.assertEqual(200, sum(hashed))
         self.assertEqual([[("5",)], [("5",)]], fetched)
 
+    def test_rowhash_differ_sql_is_unchanged(self):
+        # Only a HashDiffer leaf hashes text with its length in front. RowHashDiffer keeps the row
+        # hash that checksums sum, and with it the blind spot for '|' that moves between columns.
+        rows = [[i, i, 0.5, f"row|{i}"] for i in range(1, 11)]
+        changed = [list(row) for row in rows]
+        changed[2][3] = "changed"
+        self.fill(rows, changed)
+
+        calls, statements = [], []
+        get_key_hashes, query = TableSegment.get_key_hashes, type(self.connection)._query
+
+        def spy_hashes(segment, *args, **kwargs):
+            calls.append(kwargs)
+            return get_key_hashes(segment, *args, **kwargs)
+
+        def spy_query(database, sql_code):
+            if isinstance(sql_code, str):
+                statements.append(sql_code)
+            return query(database, sql_code)
+
+        with mock.patch.object(TableSegment, "get_key_hashes", spy_hashes), mock.patch.object(
+            type(self.connection), "_query", spy_query
+        ):
+            diff = list(RowHashDiffer().diff_tables(self.table, self.table2))
+        self.assertEqual({("-", "3"), ("+", "3")}, {(sign, row[0]) for sign, row in diff})
+        self.assertEqual([{}, {}], calls)
+        self.assertTrue(statements)
+        self.assertFalse([s for s in statements if "octet_length" in s.lower()])
+
     def test_recheck_reports_what_still_differs(self):
         rows = [[i, i, 0.5, f"row {i}"] for i in range(1, 11)]
         changed = [list(row) for row in rows]
