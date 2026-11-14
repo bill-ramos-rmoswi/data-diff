@@ -9,7 +9,7 @@ import unittest
 
 from data_diff import connect_to_table, diff_tables
 from data_diff import databases as db
-from data_diff.abcs.database_types import Native_UUID
+from data_diff.abcs.database_types import Decimal, Native_UUID
 from data_diff.databases.base import QueryError
 from data_diff.databases.db2 import Dialect as Db2Dialect
 from data_diff.databases.mssql import Dialect as MsSQLDialect
@@ -19,6 +19,7 @@ from data_diff.diff_tables import Algorithm
 from data_diff.hashdiff_tables import HashDiffer
 from data_diff.queries.api import Count, commit, table, this
 from data_diff.queries.extras import Checksum, NormalizeAsString
+from data_diff.schema import RawColumnInfo
 from data_diff.utils import ArithUUID, lob_digest
 from tests.common import CONN_STRINGS, get_conn, random_table_suffix
 
@@ -134,6 +135,75 @@ class TestMsSQLAgainstDb2(TypeTestCase):
         ms = self.table(db.MsSQL, "FLOAT", "1e18", "-0.5")
         db2 = self.table(db.Db2, "DOUBLE", "1e18", "-0.5")
         self.assert_both_directions((db.MsSQL, ms), (db.Db2, db2))
+
+    def test_numeric_matches_decimal(self):
+        values = "0", "12.3456789012", "-0.5", "-0.0000000001", "-0.9999", "999999999999999999999.9999999999", "NULL"
+        ms = self.table(db.MsSQL, "NUMERIC(31, 10)", *values)
+        db2 = self.table(db.Db2, "DECIMAL(31, 10)", *values)
+        self.assert_matches((db.MsSQL, ms), (db.Db2, db2))
+
+    def test_real_numeric_difference_is_reported(self):
+        ms = self.table(db.MsSQL, "NUMERIC(31, 10)", "-0.0000000001", "1131.25")
+        db2 = self.table(db.Db2, "DECIMAL(31, 10)", "-0.0000000002", "1131.25")
+        self.assert_both_directions((db.MsSQL, ms), (db.Db2, db2), count=2)
+
+
+@requires(db.MsSQL, db.PostgreSQL)
+class TestMsSQLNumericAgainstPostgreSQL(TypeTestCase):
+    """SQL Server `numeric` is the same type as `decimal`, and must be compared as a number."""
+
+    VALUES = {
+        "NUMERIC(38, 0)": ("0", "-1", "12", "99999999999999999999999999999999999999", "-" + "9" * 38, "NULL"),
+        "NUMERIC(38, 4)": ("0", "12.34", "0.24", "-0.5", "-0.0001", "-0.9999", "9" * 34 + ".9999", "NULL"),
+        "NUMERIC(38, 10)": ("0", "12.3456789012", "-0.5", "-0.0000000001", "-0.9999", "9" * 28 + ".9999999999", "NULL"),
+        "NUMERIC(5, 4)": ("0", "0.24", "-0.5", "-0.0001", "-0.9999", "9.9999", "-9.9999", "NULL"),
+    }
+
+    def test_numeric_matches(self):
+        for column_type, values in self.VALUES.items():
+            with self.subTest(column_type):
+                name = "n" + column_type[8:].replace(", ", "_").rstrip(")")
+                ms = self.table(db.MsSQL, column_type, *values, name=f"{name}_ms")
+                pg = self.table(db.PostgreSQL, column_type, *values, name=f"{name}_pg")
+                self.assert_matches((db.MsSQL, ms), (db.PostgreSQL, pg))
+
+    def test_numeric_at_a_lower_scale_rounds(self):
+        ms = self.table(db.MsSQL, "NUMERIC(38, 4)", "12.3456", "-0.9999", "0.0001", "-0.5000")
+        pg = self.table(db.PostgreSQL, "NUMERIC(38, 2)", "12.35", "-1.00", "0.00", "-0.50")
+        self.assert_matches((db.MsSQL, ms), (db.PostgreSQL, pg))
+
+    def test_real_numeric_difference_is_reported(self):
+        ms = self.table(db.MsSQL, "NUMERIC(19, 4)", "1131.2500")
+        pg = self.table(db.PostgreSQL, "NUMERIC(19, 4)", "1131.2501")
+        self.assert_both_directions((db.MsSQL, ms), (db.PostgreSQL, pg), count=2)
+
+    def test_real_difference_at_a_lower_scale_is_reported(self):
+        # 12.3449 rounds to 12.34, not 12.35
+        ms = self.table(db.MsSQL, "NUMERIC(38, 4)", "12.3449", "-0.5000")
+        pg = self.table(db.PostgreSQL, "NUMERIC(38, 2)", "12.35", "-0.50")
+        self.assert_both_directions((db.MsSQL, ms), (db.PostgreSQL, pg), count=2)
+
+    def test_numeric_key(self):
+        names = []
+        for cls, key_type in ((db.MsSQL, "NUMERIC(18, 0)"), (db.PostgreSQL, "BIGINT")):
+            c = get_conn(cls)
+            q = c.dialect.quote
+            name = f"nkey_{cls.__name__.lower()}{self.suffix}"
+            c.query(f"CREATE TABLE {q(name)} ({q('id')} {key_type} NOT NULL PRIMARY KEY, {q('v')} INT)", None)
+            self.created.append((c, q(name)))
+            for k in range(1, 41):
+                # The keys reach past 2^32, so that the key ranges aren't small integers only
+                c.query(f"INSERT INTO {q(name)} VALUES ({k * 300000007}, {k % 7})", None)
+            if cls is db.PostgreSQL:
+                c.query(f"UPDATE {q(name)} SET {q('v')} = 99 WHERE {q('id')} = {17 * 300000007}", None)
+            c.query(commit)
+            names.append((cls, name))
+        key = str(17 * 300000007)
+        for a, b in (names, names[::-1]):
+            with self.subTest(f"{a[0].__name__} -> {b[0].__name__}"):
+                rows = self.diff(a, b)
+                self.assertEqual([("+", key), ("-", key)], sorted((sign, row[0]) for sign, row in rows))
+                self.assertEqual({"99", str(17 % 7)}, {row[1] for _, row in rows})
 
 
 @requires(db.PostgreSQL, db.Db2)
@@ -283,6 +353,10 @@ class TestValues(unittest.TestCase):
 
     def test_db2_keeps_a_timestamp_without_a_time_zone(self):
         self.assertEqual("TIMESTAMP('2024-01-01 00:00:00')", Db2Dialect().timestamp_value(datetime(2024, 1, 1)))
+
+    def test_mssql_numeric_is_a_decimal(self):
+        info = RawColumnInfo(column_name="v", data_type="numeric", numeric_precision=19, numeric_scale=4)
+        self.assertEqual(Decimal(precision=4), MsSQLDialect().parse_type(("t",), info))
 
     def test_native_uuid_bound_has_no_case(self):
         value = ArithUUID("a1b2c3d4-0000-0000-0000-000000000001", uppercase=True)
@@ -903,6 +977,26 @@ class TestSybaseAgainstMsSQL(TypeTestCase):
         a = self.table(db.Sybase, "MONEY", *values)
         b = self.table(db.MsSQL, "MONEY", *values)
         self.assert_matches((db.Sybase, a), (db.MsSQL, b))
+
+    def test_numeric(self):
+        # ASE types numeric(38,0) as Integer
+        for column_type, values in (
+            ("NUMERIC(38, 0)", ("0", "-1", "12", "9" * 38, "-" + "9" * 38, "NULL")),
+            (
+                "NUMERIC(19, 4)",
+                ("0", "0.3200", "-0.5000", "-0.0001", "-0.9999", "1131.2500", "9" * 15 + ".9999", "NULL"),
+            ),
+        ):
+            with self.subTest(column_type):
+                name = "n" + column_type[8:].replace(", ", "_").rstrip(")")
+                a = self.table(db.Sybase, column_type, *values, name=f"{name}_ase")
+                b = self.table(db.MsSQL, column_type, *values, name=f"{name}_ms")
+                self.assert_matches((db.Sybase, a), (db.MsSQL, b))
+
+    def test_real_numeric_difference_is_reported(self):
+        a = self.table(db.Sybase, "NUMERIC(19, 4)", "1131.2500", "-0.5000")
+        b = self.table(db.MsSQL, "NUMERIC(19, 4)", "1131.2501", "-0.5000")
+        self.assert_both_directions((db.Sybase, a), (db.MsSQL, b), count=2)
 
     def test_bigdatetime(self):
         values = "'2026-01-02 03:04:05.123456'", "'9999-12-31 23:59:59.999999'"

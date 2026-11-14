@@ -76,6 +76,7 @@ class Dialect(BaseDialect):
         "float": Float,
         "real": Float,
         "decimal": Decimal,
+        "numeric": Decimal,
         "money": Decimal,
         "smallmoney": Decimal,
         # int
