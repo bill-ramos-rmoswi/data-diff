@@ -140,12 +140,14 @@ click.Context.formatter_class = MyHelpFormatter
 @click.option(
     "--bisection-factor",
     default=None,
+    type=int,
     help=f"Segments per iteration. Default={DEFAULT_BISECTION_FACTOR}.",
     metavar="NUM",
 )
 @click.option(
     "--bisection-threshold",
     default=None,
+    type=int,
     help=f"Minimal bisection threshold. Below it, data-diff will download the data and compare it locally. Default={DEFAULT_BISECTION_THRESHOLD}.",
     metavar="NUM",
 )
