@@ -170,7 +170,9 @@ class Dialect(BaseDialect):
     def render_lengthprefixed(self, c: Compiler, elem: LengthPrefixed) -> str:
         # The database is UTF-8 (code page 1208), so OCTET_LENGTH agrees with PostgreSQL's. A row whose
         # hash input then exceeds 32,672 bytes fails with SQL0137N, and the leaf downloads its rows.
-        value = self.compile(c, elem.expr)
+        # The length is taken of the VARCHAR that's hashed: a normalized GRAPHIC or VARGRAPHIC value,
+        # such as TRIM(c) for a text UUID, stays graphic, and its OCTET_LENGTH counts UTF-16 bytes.
+        value = self.to_string(self.compile(c, elem.expr))
         return f"(VARCHAR(OCTET_LENGTH({value})) || ':' || {value})"
 
     def normalize_timestamp(self, value: str, coltype: TemporalType) -> str:

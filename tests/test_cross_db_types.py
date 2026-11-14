@@ -6,6 +6,7 @@ the last digit it stored. The tests also check that a real difference is still r
 """
 from datetime import datetime, timedelta, timezone
 import unittest
+import uuid
 
 from data_diff import connect_to_table, diff_tables
 from data_diff import databases as db
@@ -251,12 +252,12 @@ class TestPostgreSQLAgainstDb2(TypeTestCase):
         db2 = self.table(db.Db2, "CLOB(100K)", text)
         self.assert_both_directions((db.PostgreSQL, pg), (db.Db2, db2))
 
-    def text_table(self, db_cls, rows, name) -> str:
+    def text_table(self, db_cls, rows, name, column_type="VARCHAR(20)") -> str:
         """Creates a table of (id, c1, c2, c3) text columns, and returns its name."""
         conn = get_conn(db_cls)
         q = conn.dialect.quote
         table_name = f"{name}{self.suffix}"
-        columns = ", ".join(f"{q(c)} VARCHAR(20)" for c in ("c1", "c2", "c3"))
+        columns = ", ".join(f"{q(c)} {column_type}" for c in ("c1", "c2", "c3"))
         conn.query(f"CREATE TABLE {q(table_name)} ({q('id')} INT NOT NULL PRIMARY KEY, {columns})", None)
         self.created.append((conn, q(table_name)))
 
@@ -292,6 +293,29 @@ class TestPostgreSQLAgainstDb2(TypeTestCase):
                     {("-", "31"), ("+", "31"), ("-", "32"), ("+", "32")}, {(sign, row[0]) for sign, row in diff}
                 )
                 self.assertEqual(2, differ.stats["rows_fetched_by_key"])
+
+    def test_leaf_vargraphic_uuids(self):
+        # Sampling types these columns as text UUIDs, which normalize to TRIM(c). On a Db2 VARGRAPHIC
+        # that stays graphic, whose OCTET_LENGTH counts UTF-16 bytes, so the length prefix must be
+        # taken of the VARCHAR that's hashed, or every equal row would be fetched by key.
+        rows = [(i, str(uuid.UUID(int=i * 7919)), str(uuid.UUID(int=i * 104729)), None) for i in range(1, 81)]
+        changed = (80, rows[-1][1], str(uuid.UUID(int=1)), None)
+        pg = self.text_table(db.PostgreSQL, rows, "leaf_uuid_pg", "VARCHAR(36)")
+        db2 = self.text_table(db.Db2, rows[:-1] + [changed], "leaf_uuid_db2", "VARGRAPHIC(36)")
+        for a, b in (((db.PostgreSQL, pg), (db.Db2, db2)), ((db.Db2, db2), (db.PostgreSQL, pg))):
+            with self.subTest(f"{a[0].__name__} -> {b[0].__name__}"):
+                segments = [
+                    connect_to_table(CONN_STRINGS[cls], name, ("id",), extra_columns=("c1", "c2", "c3"), thread_count=2)
+                    for cls, name in (a, b)
+                ]
+                differ = HashDiffer(bisection_factor=2, bisection_threshold=4000)
+                try:
+                    diff = list(differ.diff_tables(*segments))
+                finally:
+                    for segment in segments:
+                        segment.database.close()
+                self.assertEqual({("-", "80"), ("+", "80")}, {(sign, row[0]) for sign, row in diff})
+                self.assertEqual(1, differ.stats["rows_fetched_by_key"])
 
 
 @requires(db.Db2)
