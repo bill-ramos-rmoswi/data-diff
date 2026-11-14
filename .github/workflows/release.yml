@@ -21,6 +21,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # Build provenance: a signed attestation that this workflow built these files from this commit
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,9 +38,40 @@ jobs:
             echo "Tag $GITHUB_REF_NAME doesn't match package version $package_version"
             exit 1
           fi
+      - name: Take the release notes from CHANGELOG.md
+        run: python dev/release/notes.py "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
       - name: Build
         run: poetry build
+      - name: Install system libraries
+        # psycopg2 builds against libpq, and pyodbc needs unixODBC. The Azure mirror fallback is as in pr-validate
+        run: |
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/' /etc/apt/apt-mirrors.txt
+          sudo apt-get update && sudo apt-get install -y libpq-dev unixodbc-dev
+      - name: Install the wheel in a clean venv and run a diff
+        run: python dev/release/smoke_wheel.py dist/*.whl
+      - name: Install the wheel with every database extra, for the SBOM
+        run: |
+          python -m venv "$RUNNER_TEMP/sbom-env"
+          "$RUNNER_TEMP/sbom-env/bin/pip" install --quiet "$(ls dist/*.whl)[all-dbs]"
+      - name: SBOM of the wheel and its dependencies
+        uses: anchore/sbom-action@v0.24.3
+        with:
+          path: ${{ runner.temp }}/sbom-env
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Checksums
+        run: |
+          cp sbom.spdx.json dist/
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"

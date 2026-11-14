@@ -48,7 +48,9 @@ poetry run python3 -m data_diff <db1_uri> <table1> <db2_uri> <table2> --verbose
 ```
 
 - Tests use `unittest`, not pytest.
-- `.github/workflows/pr-validate.yml` runs formatting, unit tests on Python 3.9-3.11, and every database pair on 3.11. Pushing a `v*` tag matching the package version runs `release.yml`, which publishes the wheel.
+- `.github/workflows/pr-validate.yml` runs formatting, unit tests on Python 3.9-3.11, and every database pair on 3.11. Its `wheel` job builds the wheel, installs it with the database extras in a clean venv on 3.9 and 3.11, and runs a DuckDB diff through the CLI and the API (`dev/release/smoke_wheel.py`). It also fails if `CHANGELOG.md` has no section for the package version (`dev/release/notes.py --check`).
+- Pushing a `v*` tag matching the package version runs `release.yml`. That runs the smoke test again on the exact files, then publishes the wheel, the sdist, `SHA256SUMS`, an SPDX SBOM and a build-provenance attestation, with the CHANGELOG section as the release body. A release's version bump and CHANGELOG section belong in the PR with the change (see `/ship`).
+- **The dev environment hides packaging bugs.** `poetry.lock` pins what pip resolves differently. The 0.15.0 wheel's CLI failed at import on a clean install, because pip picked pydantic 2. The dbt and Datafold modules use the pydantic 1 API, so `pyproject.toml` caps it below 2. Only `smoke_wheel.py` catches this kind of failure.
 - `CONTRIBUTING.md` still says `black -l 120`. CI uses `ruff format`.
 - `LOG_LEVEL=DEBUG` prints every query and the type detected for each column.
 

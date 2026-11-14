@@ -34,11 +34,34 @@ For every expression the change adds or alters, fill this table with probed valu
 
 The test values must include NULL, the empty string, trailing spaces, non-ASCII characters (é, 漢, an emoji), the maximum precision, negative numbers under 1, and the largest and smallest dates.
 
+**Probe the SQL data-diff generates, on the real tables.** A hand-written query models the types you expect, not the ones data-diff detects. Run the diff with `LOG_LEVEL=DEBUG`, take the SQL and the detected column types from the log, and put the types in the table. In the tuning run, SQL Server `numeric` turned out to be `UnknownColType`.
+
+## 2b. Key shapes and change density
+
+A change to the differ, key ranges, leaves or fetch by key must be tested on each of these, not only on integer keys with a few changes:
+
+| Key shape | Why |
+| --- | --- |
+| integer | the common case |
+| composite (`OrderId, LineNumber`) | key tuples and their ordering |
+| native UUID (`uuid`, `uniqueidentifier`) | SQL Server sorts and renders it differently |
+| text UUID in mixed case | a normalized key may not select its row. That silently lost differences in the tuning run (F1) |
+| non-UUID text among text UUID keys | key types come from 64 sampled rows. This one aborted the diff (F2) |
+| rows with many NULL columns | NULL masks, and NULL against the text `<null>` |
+
+| Density of changes in a segment | Why |
+| --- | --- |
+| none | nothing should be downloaded |
+| sparse (1 in 1,000) | the usual case |
+| more than half | a fetch by key can cost more than downloading every row (F3) |
+| all | the worst case |
+
 ## 3. Plan rules
 
 - Prefer a dialect override to a change in `base.py`. A shared change must keep the SQL other dialects produce identical, unless a test shows it's a bug.
 - A silent truncation is a false negative. Use the form that raises an error, and name the limit in the message.
 - Pair every "should match" test with a "difference is reported" test.
+- Name every public default or behavior that changes (an API default, result order, a new path on by default), so it can be decided before implementing rather than at a STOP.
 - List the stop conditions: what result would make you stop and report instead of working around it.
 - Name the skill for each later step: `/test`, `/perf`, `/code-review`, `/ship`.
 

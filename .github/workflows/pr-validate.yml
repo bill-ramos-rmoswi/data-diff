@@ -32,6 +32,33 @@ jobs:
       - name: Run ruff
         run: poetry run ruff format --check .
 
+  wheel:
+    name: Wheel installs and diffs on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Check that CHANGELOG.md has notes for this version
+        run: python dev/release/notes.py --check
+      - name: Install system libraries
+        # psycopg2 builds against libpq, and pyodbc needs unixODBC. The Azure mirror fallback is as in "unit"
+        run: |
+          sudo sed -i 's/azure\.archive\.ubuntu\.com/archive.ubuntu.com/' /etc/apt/apt-mirrors.txt
+          sudo apt-get update && sudo apt-get install -y libpq-dev unixodbc-dev
+      - name: Install Poetry
+        run: pipx install "poetry==$POETRY_VERSION"
+      - name: Build
+        run: poetry build
+      - name: Install the wheel in a clean venv and run a diff
+        run: python dev/release/smoke_wheel.py dist/*.whl
+
   unit:
     name: Unit tests on Python ${{ matrix.python-version }}
     runs-on: ubuntu-24.04
