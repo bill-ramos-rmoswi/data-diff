@@ -2,7 +2,9 @@
 
 This fork of data-diff (`bill-ramos-rmoswi/data-diff`) is released as a wheel attached to each [GitHub Release](https://github.com/bill-ramos-rmoswi/data-diff/releases). Each version's section here is that release's description. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.16.0] - 2026-11-14
+
+Diffs from Db2, SQL Server and SAP ASE to PostgreSQL are faster than in 0.14.0, and two correctness gaps are closed. No checksum value changed.
 
 ### Added
 
@@ -11,8 +13,22 @@ This fork of data-diff (`bill-ramos-rmoswi/data-diff`) is released as a wheel at
 
 ### Fixed
 
+- **SQL Server `numeric` columns are typed as `Decimal`**, like `decimal`. They were `UnknownColType`, so a diff into SQL Server with a `numeric` column raised `TypeError`, a `numeric` key raised `NotImplementedError`, and a lower scale on the other side showed false differences. The "no compatibility handling" warning for these columns is gone. This isn't a speed change.
+- **Db2 and PostgreSQL leaves tell `'a|b','c'` from `'a','b|c'`.** Leaf row hashes length-prefix text columns that can hold `|`, so a moved separator is reported when its segment is compared by leaf. When the hash input of a Db2 row would pass 32,672 bytes (SQL0137N), the leaf downloads every row. Each leaf query costs 4-7% more, within the measured noise.
 - **The CLI failed at import on a clean install of 0.15.0** (`PydanticUserError: regex is removed`). pip installed pydantic 2, and the dbt and Datafold modules use the pydantic 1 API. The dependency is now `pydantic>=1.10.12,<2`. The Python API wasn't affected.
 - **`--bisection-factor` and `--bisection-threshold` crashed hashdiff** with `TypeError: '>=' not supported between instances of 'int' and 'str'`, because the CLI passed them as text. Both are now integers. This came from upstream data-diff.
+
+### Performance
+
+Full `diff_tables()` calls to PostgreSQL on the matched rig (4 pinned vCPUs and 4 GB per database, `N_THREADS=4`), 0.14.0 (`7f4ad77`) against `c1724ba`, median of 5 alternating runs from `dev/perf/ab.py`, median noise 6%. 26 of 27 combinations of `fact_2x`, `fact_13x` and `oltp_order_line` with identical, updated and deleted rows are faster, by 30.5% to 72.8% beyond twice their noise. Db2 `fact_2x` identical had 27% noise, so it isn't a result. The README has the table. Most of this is 0.15.0's work, measured now against 0.14.0 with the same rig; F1 and F2 add no measured gain.
+
+### Compatibility
+
+- **Checksums:** no checksum value changed. Only a false difference at a lower `numeric` scale goes away.
+- **Types:** SQL Server `numeric(p,s)` is `Decimal(precision=s)` instead of `UnknownColType`.
+- **Tested with** PostgreSQL 18.6, SQL Server 2025 CU9, Db2 12.1.5.0, SAP ASE 16.1 SP00 PL02 and MySQL 8.4.13, on Python 3.9, 3.10 and 3.11.
+- **Upgrade note:** code that caught `TypeError` or `NotImplementedError` from `numeric` columns in SQL Server no longer sees them.
+- **Known limit:** the moved `|` is still missed in checksums and in `RowHashDiffer`, which keep their row hash, so a segment above `bisection_threshold` whose only difference is a moved `|` isn't flagged.
 
 ## [0.15.0] - 2026-11-13
 
